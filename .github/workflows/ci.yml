@@ -26,8 +26,7 @@ on:
       - main
       - 0.1.x
       - develop
-  workflow_dispatch:  # Manual trigger for full validation on any branch
-
+  workflow_dispatch: # Manual trigger for full validation on any branch
 permissions:
   contents: read
 
@@ -36,7 +35,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  CI_FAILFAST_TEST_LEAVE_DANGLING: 1  # GHA does not care about dangling processes and setting this variable avoids killing the CI script itself on error
+  CI_FAILFAST_TEST_LEAVE_DANGLING: 1 # GHA does not care about dangling processes and setting this variable avoids killing the CI script itself on error
   CIRRUS_CACHE_HOST: http://127.0.0.1:12321/ # When using Cirrus Runners this host can be used by the docker `gha` build cache type.
   REPO_USE_CIRRUS_RUNNERS: '' # Disabled: using self-hosted runners
   CI_IMAGE_REGISTRY_PREFIX: qbit-ci-autoscaler:5000/qbit-cache
@@ -53,7 +52,7 @@ defaults:
 jobs:
   classify-changes:
     name: classify validation profile
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     outputs:
       profile: ${{ steps.classify.outputs.profile }}
       release_policy_only: ${{ steps.classify.outputs.release_policy_only }}
@@ -149,7 +148,7 @@ jobs:
     name: 'test each commit'
     runs-on: *qbit_runs_on
     if: false # Disabled: runner OS (Ubuntu 20.04) lacks required packages (mold, qt6)
-    timeout-minutes: 360  # Use maximum time, see https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idtimeout-minutes. Assuming a worst case time of 1 hour per commit, this leads to a --max-count=6 below.
+    timeout-minutes: 360 # Use maximum time, see https://docs.github.com/en/actions/writing-workflows/workflow-syntax-for-github-actions#jobsjob_idtimeout-minutes. Assuming a worst case time of 1 hour per commit, this leads to a --max-count=6 below.
     env:
       MAX_COUNT: 6
     steps:
@@ -203,7 +202,7 @@ jobs:
 
   macos-native-arm64:
     name: ${{ matrix.job-name }}
-    runs-on: macos-14
+    runs-on: tenki-standard-medium-4c-8g
     if: false # Disabled: no macOS runner available
 
     timeout-minutes: 120
@@ -226,11 +225,11 @@ jobs:
 
     steps:
       - &CHECKOUT
-        name: Checkout
-        uses: actions/checkout@v5
-        with:
-          # Ensure PR re-runs use merged state.
-          ref: &CHECKOUT_REF_TMPL ${{ github.event_name == 'pull_request' && github.ref || '' }}
+                name: Checkout
+                uses: actions/checkout@v5
+                with:
+                  # Ensure PR re-runs use merged state.
+                  ref: &CHECKOUT_REF_TMPL ${{ github.event_name == 'pull_request' && github.ref || '' }}
 
       - name: Clang version
         run: |
@@ -280,7 +279,7 @@ jobs:
 
   windows-native-dll:
     name: ${{ matrix.job-name }}
-    runs-on: blacksmith-8vcpu-windows-2025
+    runs-on: tenki-standard-medium-4c-8g
     needs: classify-changes
     if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) }}
     timeout-minutes: 240
@@ -609,7 +608,7 @@ jobs:
 
   windows-native-test:
     name: 'Windows, test cross-built'
-    runs-on: blacksmith-8vcpu-windows-2025
+    runs-on: tenki-standard-medium-4c-8g
     needs:
       - classify-changes
       - windows-cross
@@ -849,7 +848,7 @@ jobs:
   public-docs-lint:
     name: 'public-docs-lint'
     needs: classify-changes
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     if: ${{ (needs.classify-changes.outputs.source_validation_required == 'true' || needs.classify-changes.outputs.profile == 'public-docs') && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
     timeout-minutes: 10
     steps:
@@ -865,7 +864,7 @@ jobs:
   rpc-docs:
     name: 'rpc-docs'
     needs: classify-changes
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     if: ${{ (needs.classify-changes.outputs.source_validation_required == 'true' || needs.classify-changes.outputs.profile == 'rpc-docs') && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
     timeout-minutes: 45
 
@@ -956,7 +955,7 @@ jobs:
 
   full-validation-gate:
     name: 'Full Validation Gate'
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     needs:
       - classify-changes
       - runners
