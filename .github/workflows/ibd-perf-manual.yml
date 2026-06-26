@@ -108,7 +108,7 @@ permissions:
 jobs:
   ibd-perf:
     name: IBD perf
-    runs-on: ${{ github.repository == 'Qbit-Org/qbit' && fromJSON('["self-hosted", "linux", "x64", "qbit-trusted-ci"]') || fromJSON('["self-hosted", "linux", "x64"]') }}
+    runs-on: tenki-standard-large-plus-16c-32g
     timeout-minutes: 720
     env:
       RUN_MODE: ${{ github.event_name == 'schedule' && 'nightly' || 'manual' }}

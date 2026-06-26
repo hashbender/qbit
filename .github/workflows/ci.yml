@@ -53,7 +53,7 @@ defaults:
 jobs:
   classify-changes:
     name: classify validation profile
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     outputs:
       profile: ${{ steps.classify.outputs.profile }}
       release_policy_only: ${{ steps.classify.outputs.release_policy_only }}
@@ -131,7 +131,7 @@ jobs:
     # self-hosted pool. The same workflow then runs full validation in both with
     # no per-repo edits. Fork-PR safety is enforced separately by the trust-gate
     # `if:` conditions, independent of the runner pool.
-    runs-on: &qbit_runs_on ${{ github.repository == 'Qbit-Org/qbit' && fromJSON('["self-hosted", "linux", "x64", "qbit-trusted-ci"]') || fromJSON('["self-hosted", "linux", "x64"]') }}
+    runs-on: &qbit_runs_on tenki-standard-large-plus-16c-32g
     outputs:
       provider: ${{ steps.runners.outputs.provider }}
     steps:
@@ -203,7 +203,7 @@ jobs:
 
   macos-native-arm64:
     name: ${{ matrix.job-name }}
-    runs-on: macos-14
+    runs-on: tenki-standard-medium-4c-8g
     if: false # Disabled: no macOS runner available
 
     timeout-minutes: 120
@@ -280,7 +280,7 @@ jobs:
 
   windows-native-dll:
     name: ${{ matrix.job-name }}
-    runs-on: blacksmith-8vcpu-windows-2025
+    runs-on: tenki-standard-medium-4c-8g
     needs: classify-changes
     if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) }}
     timeout-minutes: 240
@@ -609,7 +609,7 @@ jobs:
 
   windows-native-test:
     name: 'Windows, test cross-built'
-    runs-on: blacksmith-8vcpu-windows-2025
+    runs-on: tenki-standard-medium-4c-8g
     needs:
       - classify-changes
       - windows-cross
@@ -849,7 +849,7 @@ jobs:
   public-docs-lint:
     name: 'public-docs-lint'
     needs: classify-changes
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     if: ${{ (needs.classify-changes.outputs.source_validation_required == 'true' || needs.classify-changes.outputs.profile == 'public-docs') && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
     timeout-minutes: 10
     steps:
@@ -865,7 +865,7 @@ jobs:
   rpc-docs:
     name: 'rpc-docs'
     needs: classify-changes
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     if: ${{ (needs.classify-changes.outputs.source_validation_required == 'true' || needs.classify-changes.outputs.profile == 'rpc-docs') && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
     timeout-minutes: 45
 
@@ -956,7 +956,7 @@ jobs:
 
   full-validation-gate:
     name: 'Full Validation Gate'
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     needs:
       - classify-changes
       - runners

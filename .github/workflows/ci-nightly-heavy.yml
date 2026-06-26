@@ -60,7 +60,7 @@ jobs:
   nightly-matrix:
     if: ${{ (github.event_name == 'schedule' && vars.CI_NIGHTLY_HEAVY_RUN_TEST_MATRIX != 'false') || (github.event_name == 'workflow_dispatch' && inputs.run_test_matrix) }}
     name: ${{ matrix.name }}
-    runs-on: ${{ github.repository == 'Qbit-Org/qbit' && fromJSON('["self-hosted", "linux", "x64", "qbit-trusted-ci"]') || fromJSON('["self-hosted", "linux", "x64"]') }}
+    runs-on: tenki-standard-large-plus-16c-32g
     timeout-minutes: ${{ matrix.timeout-minutes }}
     env:
       DANGER_CI_ON_HOST_FOLDERS: 1
@@ -120,7 +120,7 @@ jobs:
   scanner-readiness:
     if: ${{ (github.event_name == 'schedule' && vars.CI_NIGHTLY_HEAVY_RUN_SCANNERS != 'false') || (github.event_name == 'workflow_dispatch' && inputs.run_scanners) }}
     name: Scanner
-    runs-on: ${{ github.repository == 'Qbit-Org/qbit' && fromJSON('["self-hosted", "linux", "x64", "qbit-trusted-ci"]') || fromJSON('["self-hosted", "linux", "x64"]') }}
+    runs-on: tenki-standard-large-plus-16c-32g
     timeout-minutes: 240
     env:
       SCANNER_SET: ${{ inputs.scanner_set || 'minimum' }}
