@@ -1,0 +1,45 @@
+# Ongoing mirror of Qbit-Org/qbit PRs onto this fork, so the same CI fires on
+# tenki runners. Schedule-only (never triggered by push/PR), so it does not
+# recurse. It uses MIRROR_PAT (NOT the default GITHUB_TOKEN) on purpose: pushes
+# and PRs made with GITHUB_TOKEN do not trigger further workflow runs, which
+# would defeat the whole point. See .mirror/README.md for setup.
+name: zzz-mirror-watch
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # every 30 minutes
+  workflow_dispatch: {}        # manual "run now"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirror-watch
+  cancel-in-progress: false    # never interrupt an in-flight mirror pass
+
+jobs:
+  mirror:
+    runs-on: tenki-standard-medium-4c-8g
+    steps:
+      - name: Checkout tooling (full history, lazy blobs)
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Mirror new upstream PRs
+        env:
+          GH_TOKEN: ${{ secrets.MIRROR_PAT }}
+          PAT: ${{ secrets.MIRROR_PAT }}
+        run: |
+          set -euo pipefail
+          test -n "${PAT}" || { echo "::error::MIRROR_PAT secret is not set"; exit 1; }
+          git config --global user.name  "qbit-mirror-bot"
+          git config --global user.email "qbit-mirror-bot@users.noreply.github.com"
+          # this checkout's 'origin' is the fork; rename it and add upstream.
+          git remote rename origin fork
+          git remote set-url fork "https://x-access-token:${PAT}@github.com/hashbender/qbit"
+          git remote add origin "https://github.com/Qbit-Org/qbit"
+          # --execute, no --reset-bases: continue from the current fork tips and
+          # mirror only not-yet-mirrored upstream PRs (idempotent via body marker).
+          python3 .mirror/mirror.py --repo-dir . --execute --delay 30
