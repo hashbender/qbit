@@ -5,9 +5,12 @@
 #include <hash.h>
 #include <key_io.h>
 #include <logging.h>
+#include <crypto/common.h>
+#include <crypto/hmac_sha256.h>
 #include <node/types.h>
 #include <outputtype.h>
 #include <script/descriptor.h>
+#include <script/interpreter.h>
 #include <script/p2mr.h>
 #include <script/script.h>
 #include <script/sign.h>
@@ -20,7 +23,12 @@
 #include <util/translation.h>
 #include <wallet/scriptpubkeyman.h>
 
+#include <algorithm>
+#include <array>
 #include <optional>
+#include <set>
+#include <span>
+#include <string_view>
 
 using common::PSBTError;
 using util::ToString;
@@ -38,17 +46,51 @@ uint256 GetPQCKeyIV(const CPQCPubKey& pubkey)
     return Hash(std::span{pubkey.data(), pubkey.size()});
 }
 
-bool DecryptPQCKey(const CKeyingMaterial& master_key, std::span<const unsigned char> crypted_secret, const CPQCPubKey& pubkey, CPQCKey& key)
+uint256 GetCryptedPQCKeyAuthTag(const CKeyingMaterial& master_key, const uint256& desc_id, const CPQCPubKey& pubkey, std::span<const unsigned char> secret, uint32_t sig_counter)
 {
+    static constexpr std::string_view PQC_CKEY_AUTH_DOMAIN{"qbit wallet pqc ckey v1"};
+    std::array<unsigned char, sizeof(sig_counter)> counter_bytes{};
+    WriteLE32(counter_bytes.data(), sig_counter);
+
+    uint256 out;
+    CHMAC_SHA256(master_key.data(), master_key.size())
+        .Write(UCharCast(PQC_CKEY_AUTH_DOMAIN.data()), PQC_CKEY_AUTH_DOMAIN.size())
+        .Write(desc_id.data(), desc_id.size())
+        .Write(pubkey.data(), pubkey.size())
+        .Write(secret.data(), secret.size())
+        .Write(counter_bytes.data(), counter_bytes.size())
+        .Finalize(out.data());
+    return out;
+}
+
+bool DecryptPQCKey(const CKeyingMaterial& master_key, const uint256& desc_id, const CryptedPQCKeyRecord& crypted_key, const CPQCPubKey& pubkey, uint32_t sig_counter, CPQCKey& key, std::optional<uint256>* legacy_auth_tag_out = nullptr)
+{
+    if (legacy_auth_tag_out) legacy_auth_tag_out->reset();
+
     CKeyingMaterial secret;
-    if (!DecryptSecret(master_key, crypted_secret, GetPQCKeyIV(pubkey), secret)) {
+    if (!DecryptSecret(master_key, crypted_key.crypted_secret, GetPQCKeyIV(pubkey), secret)) {
         return false;
     }
     if (secret.size() != CPQCKey::SIZE) {
         return false;
     }
-    key.Set(secret.data(), secret.data() + secret.size());
-    return key.IsValid() && key.GetPubKey() == pubkey;
+
+    const auto secret_span{std::span<const unsigned char>{secret.data(), secret.size()}};
+    const uint256 auth_tag{GetCryptedPQCKeyAuthTag(master_key, desc_id, pubkey, secret_span, sig_counter)};
+    if (crypted_key.auth_tag) {
+        if (auth_tag != *crypted_key.auth_tag) {
+            return false;
+        }
+        key.SetFromTrustedWalletRecord(secret_span, pubkey);
+    } else {
+        key.Set(secret.data(), secret.data() + secret.size());
+    }
+
+    const bool valid{key.IsValid() && key.GetPubKey() == pubkey};
+    if (valid && legacy_auth_tag_out && !crypted_key.auth_tag) {
+        *legacy_auth_tag_out = auth_tag;
+    }
+    return valid;
 }
 
 } // namespace
@@ -912,7 +954,7 @@ util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetNewDestination(const 
             throw std::runtime_error(std::string(__func__) + ": Types are inconsistent. Stored type does not match type of newly generated address");
         }
 
-        if (!m_deferred_create_keypool_top_up) {
+        if (!m_deferred_create_keypool_top_up && !IsRangedP2MRDescriptorNoLock()) {
             TopUp();
         }
 
@@ -947,7 +989,8 @@ bool DescriptorScriptPubKeyMan::IsMine(const CScript& script) const
 bool DescriptorScriptPubKeyMan::CheckDecryptionKey(const CKeyingMaterial& master_key)
 {
     LOCK(cs_desc_man);
-    if (!m_map_keys.empty() || !m_map_pqc_keys.empty()) {
+    if (!m_map_keys.empty() ||
+        (!m_map_pqc_keys.empty() && m_map_crypted_keys.empty() && m_map_crypted_pqc_keys.empty())) {
         return false;
     }
 
@@ -966,14 +1009,25 @@ bool DescriptorScriptPubKeyMan::CheckDecryptionKey(const CKeyingMaterial& master
             break;
     }
     if (!keyFail) {
-        for (const auto& [pubkey, crypted_secret] : m_map_crypted_pqc_keys) {
+        const bool has_legacy_crypted_pqc_keys{std::any_of(m_map_crypted_pqc_keys.begin(), m_map_crypted_pqc_keys.end(), [](const auto& entry) {
+            return !entry.second.auth_tag.has_value();
+        })};
+        WalletBatch batch(m_storage.GetDatabase());
+        for (auto& [pubkey, crypted_key] : m_map_crypted_pqc_keys) {
             CPQCKey key;
-            if (!DecryptPQCKey(master_key, crypted_secret, pubkey, key)) {
+            const auto counter_it{m_map_pqc_sig_counters.find(pubkey)};
+            const uint32_t sig_counter{counter_it != m_map_pqc_sig_counters.end() ? counter_it->second : 0};
+            std::optional<uint256> legacy_auth_tag;
+            if (!DecryptPQCKey(master_key, m_wallet_descriptor.id, crypted_key, pubkey, sig_counter, key, &legacy_auth_tag)) {
                 keyFail = true;
                 break;
             }
+            if (legacy_auth_tag &&
+                batch.WriteCryptedDescriptorPQCKey(m_wallet_descriptor.id, pubkey, crypted_key.crypted_secret, sig_counter, &*legacy_auth_tag)) {
+                crypted_key.auth_tag = *legacy_auth_tag;
+            }
             keyPass = true;
-            if (m_decryption_thoroughly_checked) {
+            if (m_decryption_thoroughly_checked && !has_legacy_crypted_pqc_keys) {
                 break;
             }
         }
@@ -992,6 +1046,9 @@ bool DescriptorScriptPubKeyMan::CheckDecryptionKey(const CKeyingMaterial& master
 bool DescriptorScriptPubKeyMan::Encrypt(const CKeyingMaterial& master_key, WalletBatch* batch)
 {
     LOCK(cs_desc_man);
+    if (HasBlockedPlaintextPQCKeys()) {
+        return false;
+    }
     if (!m_map_crypted_keys.empty() || !m_map_crypted_pqc_keys.empty()) {
         return false;
     }
@@ -1016,17 +1073,21 @@ bool DescriptorScriptPubKeyMan::Encrypt(const CKeyingMaterial& master_key, Walle
         }
         const auto counter_it = m_map_pqc_sig_counters.find(pubkey);
         const uint32_t sig_counter = counter_it != m_map_pqc_sig_counters.end() ? counter_it->second : 0;
-        m_map_crypted_pqc_keys[pubkey] = crypted_secret;
-        batch->WriteCryptedDescriptorPQCKey(GetID(), pubkey, crypted_secret, sig_counter);
+        const uint256 auth_tag{GetCryptedPQCKeyAuthTag(master_key, GetID(), pubkey, std::span<const unsigned char>{secret.data(), secret.size()}, sig_counter)};
+        m_map_crypted_pqc_keys[pubkey] = CryptedPQCKeyRecord{crypted_secret, auth_tag};
+        batch->WriteCryptedDescriptorPQCKey(GetID(), pubkey, crypted_secret, sig_counter, &auth_tag);
     }
     m_map_keys.clear();
     m_map_pqc_keys.clear();
     return true;
 }
 
-util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetReservedDestination(const OutputType type, bool internal, int64_t& index)
+util::Result<CTxDestination> DescriptorScriptPubKeyMan::GetReservedDestination(const OutputType type, bool internal, int64_t& index, bool allow_internal_p2mr_refill)
 {
     LOCK(cs_desc_man);
+    if (internal && allow_internal_p2mr_refill) {
+        MaybeTopUpInternalP2MRKeyPool();
+    }
     auto op_dest = GetNewDestination(type);
     index = m_wallet_descriptor.next_index - 1;
     return op_dest;
@@ -1127,13 +1188,33 @@ bool DescriptorScriptPubKeyMan::TopUpWithInternalHint(std::optional<bool> intern
     return TopUpWithInternalHintResult(internal_hint, size).has_value();
 }
 
+DescriptorScriptPubKeyMan::TopUpPreparation DescriptorScriptPubKeyMan::PrepareTopUp(std::optional<bool> internal_hint) const
+{
+    TopUpPreparation prepared;
+    prepared.spkman_is_internal = internal_hint.has_value() ? internal_hint : m_storage.IsInternalScriptPubKeyMan(this);
+    prepared.provider.keys = GetKeys();
+    prepared.has_encryption_keys = m_storage.HasEncryptionKeys();
+    if (prepared.has_encryption_keys) {
+        m_storage.WithEncryptionKey([&](const CKeyingMaterial& key) {
+            if (!key.empty()) {
+                prepared.encryption_key = key;
+            }
+            return true;
+        });
+    }
+    return prepared;
+}
+
 util::Result<void> DescriptorScriptPubKeyMan::TopUpWithInternalHintResult(std::optional<bool> internal_hint, unsigned int size)
 {
+    const TopUpPreparation prepared{PrepareTopUp(internal_hint)};
+    LOCK(cs_desc_man);
+    // Keep descriptor and database lock ordering aligned with address reservation.
     WalletBatch batch(m_storage.GetDatabase());
     if (!batch.TxnBegin()) {
         return util::Error{_("Error starting descriptors keypool top-up database transaction")};
     }
-    util::Result<void> res{TopUpWithDBResult(batch, size, internal_hint, /*throw_on_persistence_error=*/false, /*rollback_state_on_error=*/true)};
+    util::Result<void> res{TopUpWithDBPreparedResult(batch, size, prepared, /*throw_on_persistence_error=*/false, /*rollback_state_on_error=*/true)};
     if (!res) {
         if (!batch.TxnAbort()) {
             throw std::runtime_error(strprintf(
@@ -1153,21 +1234,14 @@ bool DescriptorScriptPubKeyMan::TopUpWithDB(WalletBatch& batch, unsigned int siz
 
 util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& batch, unsigned int size, std::optional<bool> internal_hint, bool throw_on_persistence_error, bool rollback_state_on_error)
 {
-    const std::optional<bool> spkman_is_internal = internal_hint.has_value() ? internal_hint : m_storage.IsInternalScriptPubKeyMan(this);
-    FlatSigningProvider provider;
-    provider.keys = GetKeys();
-    const bool has_encryption_keys = m_storage.HasEncryptionKeys();
-    std::optional<CKeyingMaterial> encryption_key;
-    if (has_encryption_keys) {
-        m_storage.WithEncryptionKey([&](const CKeyingMaterial& key) {
-            if (!key.empty()) {
-                encryption_key = key;
-            }
-            return true;
-        });
-    }
-
+    const TopUpPreparation prepared{PrepareTopUp(internal_hint)};
     LOCK(cs_desc_man);
+    return TopUpWithDBPreparedResult(batch, size, prepared, throw_on_persistence_error, rollback_state_on_error);
+}
+
+util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBPreparedResult(WalletBatch& batch, unsigned int size, const TopUpPreparation& prepared, bool throw_on_persistence_error, bool rollback_state_on_error)
+{
+    AssertLockHeld(cs_desc_man);
     const int32_t old_range_start{m_wallet_descriptor.range_start};
     const int32_t old_range_end{m_wallet_descriptor.range_end};
     const std::optional<bool> old_descriptor_deferred_create_keypool_top_up{m_wallet_descriptor.deferred_create_keypool_top_up};
@@ -1178,7 +1252,7 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& bat
     std::set<CPubKey> added_pubkeys;
     struct OldPQCKeyState {
         std::optional<CPQCKey> key;
-        std::optional<std::vector<unsigned char>> crypted_key;
+        std::optional<CryptedPQCKeyRecord> crypted_key;
         std::optional<uint32_t> sig_counter;
     };
     std::map<CPQCPubKey, OldPQCKeyState> old_pqc_key_values;
@@ -1282,8 +1356,8 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& bat
         has_ecdsa_p2mr_source = !pubkeys.empty() || !ext_pubs.empty();
         for (const auto& pubkey : pubkeys) {
             has_private_p2mr_source |= HasPrivKey(pubkey.GetID());
-            const auto it = provider.keys.find(pubkey.GetID());
-            if (it != provider.keys.end()) {
+            const auto it = prepared.provider.keys.find(pubkey.GetID());
+            if (it != prepared.provider.keys.end()) {
                 pqc_master_key = it->second;
                 break;
             }
@@ -1291,8 +1365,8 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& bat
         for (const auto& ext_pub : ext_pubs) {
             has_private_p2mr_source |= HasPrivKey(ext_pub.pubkey.GetID());
             if (pqc_master_key) continue;
-            const auto it = provider.keys.find(ext_pub.pubkey.GetID());
-            if (it != provider.keys.end()) {
+            const auto it = prepared.provider.keys.find(ext_pub.pubkey.GetID());
+            if (it != prepared.provider.keys.end()) {
                 pqc_master_key = it->second;
             }
         }
@@ -1304,7 +1378,7 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& bat
         if (can_derive_pqc) {
             const auto* seed_ptr = reinterpret_cast<const unsigned char*>(pqc_master_key->begin());
             const uint32_t pqc_index = 0;
-            if (spkman_is_internal.has_value()) {
+            if (prepared.spkman_is_internal.has_value()) {
                 // Non-ranged pqc(...) descriptors always expand the address path
                 // via change=0, so keep the pre-derived private key aligned.
                 const uint32_t change = 0U;
@@ -1313,10 +1387,10 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& bat
                     return top_up_error(Untranslated(strprintf("failed to derive P2MR private key at descriptor index %d", i)));
                 }
                 const CPQCPubKey pqc_pub = pqc_key.GetPubKey();
-                const bool had_pqc_key = m_map_pqc_keys.contains(pqc_pub) || m_map_crypted_pqc_keys.contains(pqc_pub);
+                const bool had_pqc_key = m_map_pqc_keys.contains(pqc_pub) || m_map_crypted_pqc_keys.contains(pqc_pub) || m_pending_plaintext_pqc_keys.contains(pqc_pub);
                 remember_pqc_key(pqc_pub);
-                if (!AddDescriptorPQCKeyWithDB(batch, pqc_pub, pqc_key, has_encryption_keys, encryption_key ? &*encryption_key : nullptr)) {
-                    if (has_encryption_keys && !encryption_key) {
+                if (!AddDescriptorPQCKeyWithDB(batch, pqc_pub, pqc_key, prepared.has_encryption_keys, prepared.encryption_key ? &*prepared.encryption_key : nullptr)) {
+                    if (prepared.has_encryption_keys && !prepared.encryption_key) {
                         return persistence_error(_("wallet encryption key is unavailable for P2MR private-key persistence"), /*persistence_write_may_have_started=*/false);
                     }
                     return persistence_error(Untranslated(strprintf("failed to write P2MR private key at descriptor index %d", i)));
@@ -1330,10 +1404,10 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& bat
                         return top_up_error(Untranslated(strprintf("failed to derive P2MR private key at descriptor index %d", i)));
                     }
                     const CPQCPubKey pqc_pub = pqc_key.GetPubKey();
-                    const bool had_pqc_key = m_map_pqc_keys.contains(pqc_pub) || m_map_crypted_pqc_keys.contains(pqc_pub);
+                    const bool had_pqc_key = m_map_pqc_keys.contains(pqc_pub) || m_map_crypted_pqc_keys.contains(pqc_pub) || m_pending_plaintext_pqc_keys.contains(pqc_pub);
                     remember_pqc_key(pqc_pub);
-                    if (!AddDescriptorPQCKeyWithDB(batch, pqc_pub, pqc_key, has_encryption_keys, encryption_key ? &*encryption_key : nullptr)) {
-                        if (has_encryption_keys && !encryption_key) {
+                    if (!AddDescriptorPQCKeyWithDB(batch, pqc_pub, pqc_key, prepared.has_encryption_keys, prepared.encryption_key ? &*prepared.encryption_key : nullptr)) {
+                        if (prepared.has_encryption_keys && !prepared.encryption_key) {
                             return persistence_error(_("wallet encryption key is unavailable for P2MR private-key persistence"), /*persistence_write_may_have_started=*/false);
                         }
                         return persistence_error(Untranslated(strprintf("failed to write P2MR private key at descriptor index %d", i)));
@@ -1349,8 +1423,8 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& bat
         // Maybe we have a cached xpub and we can expand from the cache first
         const bool expanded_from_cache = m_wallet_descriptor.descriptor->ExpandFromCache(i, m_wallet_descriptor.cache, scripts_temp, out_keys);
         if (!expanded_from_cache) {
-            if (!m_wallet_descriptor.descriptor->Expand(i, provider, scripts_temp, out_keys, &temp_cache)) {
-                if (is_p2mr && has_encryption_keys && !encryption_key && has_private_p2mr_source) {
+            if (!m_wallet_descriptor.descriptor->Expand(i, prepared.provider, scripts_temp, out_keys, &temp_cache)) {
+                if (is_p2mr && prepared.has_encryption_keys && !prepared.encryption_key && has_private_p2mr_source) {
                     return persistence_error(_("wallet encryption key is unavailable for P2MR private-key persistence"), /*persistence_write_may_have_started=*/false);
                 }
                 return top_up_error(Untranslated(strprintf("descriptor expansion failed at index %d; private derivation material may be missing or unavailable", i)));
@@ -1361,22 +1435,22 @@ util::Result<void> DescriptorScriptPubKeyMan::TopUpWithDBResult(WalletBatch& bat
                 // Cache entries only retain the derived PQC pubkey. Re-expand the
                 // private side so imported cached descriptors can still persist the
                 // signable PQC keys the wallet needs.
-                m_wallet_descriptor.descriptor->ExpandPrivate(i, provider, out_keys);
+                m_wallet_descriptor.descriptor->ExpandPrivate(i, prepared.provider, out_keys);
             }
-            if (has_encryption_keys && !encryption_key && has_private_p2mr_source) {
+            if (prepared.has_encryption_keys && !prepared.encryption_key && has_private_p2mr_source) {
                 for (const auto& p2mr_pair : out_keys.p2mr_pubkeys) {
                     const CPQCPubKey& pqc_pub = p2mr_pair.second;
-                    const bool has_pqc_key = m_map_pqc_keys.contains(pqc_pub) || m_map_crypted_pqc_keys.contains(pqc_pub);
+                    const bool has_pqc_key = m_map_pqc_keys.contains(pqc_pub) || m_map_crypted_pqc_keys.contains(pqc_pub) || m_pending_plaintext_pqc_keys.contains(pqc_pub);
                     if (!has_pqc_key && !out_keys.pqc_keys.contains(pqc_pub)) {
                         return persistence_error(_("wallet encryption key is unavailable for P2MR private-key persistence"), /*persistence_write_may_have_started=*/false);
                     }
                 }
             }
             for (const auto& [pqc_pub, pqc_key] : out_keys.pqc_keys) {
-                const bool had_pqc_key = m_map_pqc_keys.contains(pqc_pub) || m_map_crypted_pqc_keys.contains(pqc_pub);
+                const bool had_pqc_key = m_map_pqc_keys.contains(pqc_pub) || m_map_crypted_pqc_keys.contains(pqc_pub) || m_pending_plaintext_pqc_keys.contains(pqc_pub);
                 remember_pqc_key(pqc_pub);
-                if (!AddDescriptorPQCKeyWithDB(batch, pqc_pub, pqc_key, has_encryption_keys, encryption_key ? &*encryption_key : nullptr)) {
-                    if (has_encryption_keys && !encryption_key) {
+                if (!AddDescriptorPQCKeyWithDB(batch, pqc_pub, pqc_key, prepared.has_encryption_keys, prepared.encryption_key ? &*prepared.encryption_key : nullptr)) {
+                    if (prepared.has_encryption_keys && !prepared.encryption_key) {
                         return persistence_error(_("wallet encryption key is unavailable for P2MR private-key persistence"), /*persistence_write_may_have_started=*/false);
                     }
                     return persistence_error(Untranslated(strprintf("failed to write P2MR private key at descriptor index %d", i)));
@@ -1511,7 +1585,7 @@ bool DescriptorScriptPubKeyMan::AddDescriptorPQCKeyWithDB(WalletBatch& batch, co
     AssertLockHeld(cs_desc_man);
     assert(!m_storage.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS));
 
-    if (m_map_pqc_keys.contains(pubkey) || m_map_crypted_pqc_keys.contains(pubkey)) {
+    if (m_map_pqc_keys.contains(pubkey) || m_map_crypted_pqc_keys.contains(pubkey) || m_pending_plaintext_pqc_keys.contains(pubkey)) {
         return true;
     }
 
@@ -1526,8 +1600,9 @@ bool DescriptorScriptPubKeyMan::AddDescriptorPQCKeyWithDB(WalletBatch& batch, co
             return false;
         }
 
-        m_map_crypted_pqc_keys[pubkey] = crypted_secret;
-        if (!batch.WriteCryptedDescriptorPQCKey(GetID(), pubkey, crypted_secret, /*sig_counter=*/0)) {
+        const uint256 auth_tag{GetCryptedPQCKeyAuthTag(*encryption_key, GetID(), pubkey, std::span<const unsigned char>{secret.data(), secret.size()}, /*sig_counter=*/0)};
+        m_map_crypted_pqc_keys[pubkey] = CryptedPQCKeyRecord{crypted_secret, auth_tag};
+        if (!batch.WriteCryptedDescriptorPQCKey(GetID(), pubkey, crypted_secret, /*sig_counter=*/0, &auth_tag)) {
             m_map_crypted_pqc_keys.erase(pubkey);
             return false;
         }
@@ -1587,6 +1662,88 @@ void DescriptorScriptPubKeyMan::MaybeRestoreDeferredCreateKeyPoolTopUp()
     m_deferred_create_keypool_top_up = ShouldDeferCreateKeyPoolTopUp(m_wallet_descriptor, m_keypool_size);
 }
 
+bool DescriptorScriptPubKeyMan::IsRangedP2MRDescriptorNoLock() const
+{
+    AssertLockHeld(cs_desc_man);
+    if (!m_wallet_descriptor.descriptor) return false;
+    const std::optional<OutputType> output_type{m_wallet_descriptor.descriptor->GetOutputType()};
+    return output_type && *output_type == OutputType::P2MR && m_wallet_descriptor.descriptor->IsRange();
+}
+
+bool DescriptorScriptPubKeyMan::IsRangedP2MRDescriptor() const
+{
+    LOCK(cs_desc_man);
+    return IsRangedP2MRDescriptorNoLock();
+}
+
+unsigned int DescriptorScriptPubKeyMan::GetKeyPoolSizeNoLock() const
+{
+    AssertLockHeld(cs_desc_man);
+    if (m_wallet_descriptor.range_end <= m_wallet_descriptor.next_index) return 0;
+    return static_cast<unsigned int>(m_wallet_descriptor.range_end - m_wallet_descriptor.next_index);
+}
+
+bool DescriptorScriptPubKeyMan::NeedsP2MRKeyPoolRefillNoLock() const
+{
+    AssertLockHeld(cs_desc_man);
+    return IsRangedP2MRDescriptorNoLock() &&
+           !m_deferred_create_keypool_top_up &&
+           GetKeyPoolSizeNoLock() < static_cast<unsigned int>(m_keypool_size) &&
+           GetKeyPoolSizeNoLock() <= GetP2MRReceiveKeyPoolLowWatermarkNoLock();
+}
+
+void DescriptorScriptPubKeyMan::MaybeTopUpInternalP2MRKeyPool()
+{
+    AssertLockHeld(cs_desc_man);
+    if (m_storage.IsLocked() || !NeedsP2MRKeyPoolRefillNoLock()) return;
+
+    const unsigned int target{GetP2MRReceiveKeyPoolRefillStepTargetNoLock()};
+    if (target == 0) return;
+    (void)TopUpWithInternalHintResult(/*internal_hint=*/true, target);
+}
+
+unsigned int DescriptorScriptPubKeyMan::GetP2MRReceiveKeyPoolLowWatermarkNoLock() const
+{
+    AssertLockHeld(cs_desc_man);
+    return std::min<int64_t>(
+        m_keypool_size,
+        std::max<int64_t>(DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL, m_keypool_size / 10));
+}
+
+unsigned int DescriptorScriptPubKeyMan::GetP2MRReceiveKeyPoolLowWatermark() const
+{
+    LOCK(cs_desc_man);
+    return GetP2MRReceiveKeyPoolLowWatermarkNoLock();
+}
+
+bool DescriptorScriptPubKeyMan::NeedsP2MRReceiveKeyPoolRefill() const
+{
+    LOCK(cs_desc_man);
+    return NeedsP2MRKeyPoolRefillNoLock();
+}
+
+bool DescriptorScriptPubKeyMan::P2MRReceiveKeyPoolFull() const
+{
+    LOCK(cs_desc_man);
+    return !IsRangedP2MRDescriptorNoLock() ||
+           GetKeyPoolSizeNoLock() >= static_cast<unsigned int>(m_keypool_size);
+}
+
+unsigned int DescriptorScriptPubKeyMan::GetP2MRReceiveKeyPoolRefillStepTargetNoLock() const
+{
+    AssertLockHeld(cs_desc_man);
+    if (!IsRangedP2MRDescriptorNoLock()) return 0;
+    return std::min<int64_t>(
+        m_keypool_size,
+        int64_t{GetKeyPoolSizeNoLock()} + DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL);
+}
+
+unsigned int DescriptorScriptPubKeyMan::GetP2MRReceiveKeyPoolRefillStepTarget() const
+{
+    LOCK(cs_desc_man);
+    return GetP2MRReceiveKeyPoolRefillStepTargetNoLock();
+}
+
 bool DescriptorScriptPubKeyMan::IsHDEnabled() const
 {
     LOCK(cs_desc_man);
@@ -1622,7 +1779,7 @@ bool DescriptorScriptPubKeyMan::CanGetAddresses(bool internal) const
 bool DescriptorScriptPubKeyMan::HavePrivateKeys() const
 {
     LOCK(cs_desc_man);
-    return !m_map_keys.empty() || !m_map_crypted_keys.empty() || !m_map_pqc_keys.empty() || !m_map_crypted_pqc_keys.empty();
+    return !m_map_keys.empty() || !m_map_crypted_keys.empty() || !m_map_pqc_keys.empty() || !m_map_crypted_pqc_keys.empty() || !m_pending_plaintext_pqc_keys.empty();
 }
 
 bool DescriptorScriptPubKeyMan::HaveCryptedKeys() const
@@ -1631,10 +1788,65 @@ bool DescriptorScriptPubKeyMan::HaveCryptedKeys() const
     return !m_map_crypted_keys.empty() || !m_map_crypted_pqc_keys.empty();
 }
 
+bool DescriptorScriptPubKeyMan::HasBlockedPlaintextPQCKeys() const
+{
+    AssertLockHeld(cs_desc_man);
+    return !m_pending_plaintext_pqc_keys.empty() || !m_failed_plaintext_pqc_keys.empty();
+}
+
+bool DescriptorScriptPubKeyMan::IsPlaintextPQCKeyBlocked(const CPQCPubKey& pubkey) const
+{
+    AssertLockHeld(cs_desc_man);
+    if (m_pending_plaintext_pqc_keys.contains(pubkey)) return true;
+    return m_failed_plaintext_pqc_keys.contains(pubkey) && !m_map_crypted_pqc_keys.contains(pubkey);
+}
+
+std::set<CPQCPubKey> DescriptorScriptPubKeyMan::GetBlockedPlaintextPQCKeys() const
+{
+    AssertLockHeld(cs_desc_man);
+    std::set<CPQCPubKey> blocked_pubkeys;
+    for (const auto& [pubkey, _] : m_pending_plaintext_pqc_keys) {
+        blocked_pubkeys.insert(pubkey);
+    }
+    for (const CPQCPubKey& pubkey : m_failed_plaintext_pqc_keys) {
+        if (!m_map_crypted_pqc_keys.contains(pubkey)) {
+            blocked_pubkeys.insert(pubkey);
+        }
+    }
+    return blocked_pubkeys;
+}
+
+PQCKeyValidationInfo DescriptorScriptPubKeyMan::GetPQCKeyValidationInfo() const
+{
+    LOCK(cs_desc_man);
+    PQCKeyValidationInfo info;
+    info.pending_records = m_pending_plaintext_pqc_keys.size();
+    info.validated_records = m_map_pqc_keys.size();
+    info.failed_records = m_failed_plaintext_pqc_keys.size();
+    info.plaintext_records = info.pending_records + info.validated_records + info.failed_records;
+    info.signing_blocked = info.pending_records > 0 || info.failed_records > 0;
+    info.encryption_recommended = info.plaintext_records > 0 && info.failed_records == 0;
+
+    if (info.failed_records > 0) {
+        info.status = PQCKeyValidationStatus::FAILED;
+    } else if (info.pending_records > 0) {
+        info.status = PQCKeyValidationStatus::PENDING;
+    } else if (info.plaintext_records > 0) {
+        info.status = PQCKeyValidationStatus::COMPLETE;
+    } else {
+        info.status = PQCKeyValidationStatus::NOT_REQUIRED;
+    }
+
+    if (info.plaintext_records > 0) {
+        info.progress = static_cast<double>(info.validated_records) / static_cast<double>(info.plaintext_records);
+    }
+    return info;
+}
+
 unsigned int DescriptorScriptPubKeyMan::GetKeyPoolSize() const
 {
     LOCK(cs_desc_man);
-    return m_wallet_descriptor.range_end - m_wallet_descriptor.next_index;
+    return GetKeyPoolSizeNoLock();
 }
 
 int64_t DescriptorScriptPubKeyMan::GetTimeFirstKey() const
@@ -1676,7 +1888,7 @@ std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProvid
 
     // Always try to get the signing provider with private keys. This function should only be called during signing anyways
     std::unique_ptr<FlatSigningProvider> out = GetSigningProvider(index, true, pqc_counter_observer);
-    if (!out->HaveKey(pubkey.GetID())) {
+    if (!out || !out->HaveKey(pubkey.GetID())) {
         return nullptr;
     }
     return out;
@@ -1685,11 +1897,16 @@ std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProvid
 std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProvider(const CPQCPubKey& pubkey, const PQCSignatureCounterObserver& pqc_counter_observer) const
 {
     std::optional<CPQCKey> plain_key;
-    std::optional<std::vector<unsigned char>> crypted_key;
+    std::optional<CryptedPQCKeyRecord> crypted_key;
+    uint256 desc_id;
     uint32_t sig_counter{0};
+    bool has_encryption_keys{false};
 
     {
         LOCK(cs_desc_man);
+        desc_id = m_wallet_descriptor.id;
+        has_encryption_keys = m_storage.HasEncryptionKeys();
+        if (IsPlaintextPQCKeyBlocked(pubkey)) return nullptr;
 
         if (const auto it = m_map_pqc_keys.find(pubkey); it != m_map_pqc_keys.end()) {
             plain_key = it->second;
@@ -1704,13 +1921,15 @@ std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProvid
         }
     }
 
+    if (plain_key.has_value() && has_encryption_keys && m_storage.IsLocked()) return nullptr;
+
     if (crypted_key.has_value()) {
         if (m_storage.IsLocked()) return nullptr;
 
         CPQCKey decrypted_key;
         bool decrypted{false};
         m_storage.WithEncryptionKey([&](const CKeyingMaterial& encryption_key) {
-            decrypted = DecryptPQCKey(encryption_key, *crypted_key, pubkey, decrypted_key);
+            decrypted = DecryptPQCKey(encryption_key, desc_id, *crypted_key, pubkey, sig_counter, decrypted_key);
             return true;
         });
         if (!decrypted) return nullptr;
@@ -1723,6 +1942,7 @@ std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProvid
     out->pqc_keys.emplace(pubkey, *plain_key);
     out->pqc_sig_counters.emplace(pubkey, sig_counter);
     out->pqc_counter_reserver = MakePQCSignatureCounterReserver();
+    out->pqc_counter_batch_reserver = MakePQCSignatureCounterBatchReserver();
     out->pqc_counter_observer = pqc_counter_observer;
     return out;
 }
@@ -1731,6 +1951,7 @@ std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProvid
 {
     std::unique_ptr<FlatSigningProvider> out_keys = std::make_unique<FlatSigningProvider>();
     std::shared_ptr<Descriptor> descriptor;
+    uint256 desc_id;
     bool have_private_keys{false};
     bool has_encryption_keys{false};
     KeyMap keys;
@@ -1738,9 +1959,11 @@ std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProvid
     PQCKeyMap pqc_keys;
     CryptedPQCKeyMap crypted_pqc_keys;
     std::map<CPQCPubKey, uint32_t> pqc_sig_counters;
+    std::set<CPQCPubKey> blocked_pqc_keys;
 
     {
         LOCK(cs_desc_man);
+        desc_id = m_wallet_descriptor.id;
         descriptor = m_wallet_descriptor.descriptor;
 
         // Fetch SigningProvider from cache to avoid re-deriving
@@ -1759,11 +1982,26 @@ std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProvid
         if (include_private) {
             have_private_keys = !m_map_keys.empty() || !m_map_crypted_keys.empty() || !m_map_pqc_keys.empty() || !m_map_crypted_pqc_keys.empty();
             if (have_private_keys) {
+                blocked_pqc_keys = GetBlockedPlaintextPQCKeys();
                 has_encryption_keys = m_storage.HasEncryptionKeys();
                 keys = m_map_keys;
                 crypted_keys = m_map_crypted_keys;
                 pqc_keys = m_map_pqc_keys;
+                for (auto it = pqc_keys.begin(); it != pqc_keys.end();) {
+                    if (blocked_pqc_keys.contains(it->first)) {
+                        it = pqc_keys.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
                 crypted_pqc_keys = m_map_crypted_pqc_keys;
+                for (auto it = crypted_pqc_keys.begin(); it != crypted_pqc_keys.end();) {
+                    if (blocked_pqc_keys.contains(it->first)) {
+                        it = crypted_pqc_keys.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
                 pqc_sig_counters = m_map_pqc_sig_counters;
             }
         }
@@ -1778,7 +2016,12 @@ std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProvid
     master_provider.keys = std::move(keys);
 
     // Build private providers after releasing cs_desc_man to preserve the wallet->descriptor lock order.
-    if (has_encryption_keys && !m_storage.IsLocked()) {
+    const bool encrypted_locked{has_encryption_keys && m_storage.IsLocked()};
+    if (encrypted_locked) {
+        pqc_keys.clear();
+        pqc_sig_counters.clear();
+    }
+    if (has_encryption_keys && !encrypted_locked) {
         m_storage.WithEncryptionKey([&](const CKeyingMaterial& encryption_key) {
             for (const auto& [_, key_pair] : crypted_keys) {
                 const CPubKey& pubkey = key_pair.first;
@@ -1789,9 +2032,11 @@ std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProvid
                 }
                 master_provider.keys[pubkey.GetID()] = key;
             }
-            for (const auto& [pubkey, crypted_secret] : crypted_pqc_keys) {
+            for (const auto& [pubkey, crypted_key] : crypted_pqc_keys) {
                 CPQCKey key;
-                if (!DecryptPQCKey(encryption_key, crypted_secret, pubkey, key)) {
+                const auto counter_it{pqc_sig_counters.find(pubkey)};
+                const uint32_t sig_counter{counter_it != pqc_sig_counters.end() ? counter_it->second : 0};
+                if (!DecryptPQCKey(encryption_key, desc_id, crypted_key, pubkey, sig_counter, key)) {
                     continue;
                 }
                 pqc_keys[pubkey] = key;
@@ -1803,7 +2048,12 @@ std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProvid
     descriptor->ExpandPrivate(index, master_provider, *out_keys);
     out_keys->pqc_keys.insert(pqc_keys.begin(), pqc_keys.end());
     out_keys->pqc_sig_counters.insert(pqc_sig_counters.begin(), pqc_sig_counters.end());
+    for (const CPQCPubKey& pubkey : blocked_pqc_keys) {
+        out_keys->pqc_keys.erase(pubkey);
+        out_keys->pqc_sig_counters.erase(pubkey);
+    }
     out_keys->pqc_counter_reserver = MakePQCSignatureCounterReserver();
+    out_keys->pqc_counter_batch_reserver = MakePQCSignatureCounterBatchReserver();
     out_keys->pqc_counter_observer = pqc_counter_observer;
 
     return out_keys;
@@ -1811,27 +2061,118 @@ std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProvid
 
 bool DescriptorScriptPubKeyMan::ReservePQCSignatureCounters(const CPQCPubKey& pubkey, uint32_t count, uint32_t& previous_counter, uint32_t& reserved_counter) const
 {
-    if (count == 0 || count > PQC_MAX_SIGNATURES) return false;
+    std::map<CPQCPubKey, uint32_t> counts{{pubkey, count}};
+    std::map<CPQCPubKey, PQCSignatureCounterRange> ranges;
+    if (!ReservePQCSignatureCountersBatch(counts, ranges)) return false;
 
-    LOCK(cs_desc_man);
-    const auto key_it = m_map_pqc_keys.find(pubkey);
-    const auto crypted_key_it = m_map_crypted_pqc_keys.find(pubkey);
-    if (key_it == m_map_pqc_keys.end() && crypted_key_it == m_map_crypted_pqc_keys.end()) return false;
-    auto counter_it = m_map_pqc_sig_counters.find(pubkey);
-    if (counter_it == m_map_pqc_sig_counters.end()) return false;
-    if (counter_it->second > PQC_MAX_SIGNATURES - count) return false;
+    const auto range_it{ranges.find(pubkey)};
+    if (range_it == ranges.end()) return false;
+    previous_counter = range_it->second.previous_counter;
+    reserved_counter = range_it->second.reserved_counter;
+    return true;
+}
 
-    previous_counter = counter_it->second;
-    reserved_counter = previous_counter + count;
-
-    WalletBatch batch(m_storage.GetDatabase());
-    if (key_it != m_map_pqc_keys.end()) {
-        if (!batch.WriteDescriptorPQCKey(m_wallet_descriptor.id, pubkey, key_it->second, reserved_counter)) return false;
-    } else {
-        if (!batch.WriteCryptedDescriptorPQCKey(m_wallet_descriptor.id, pubkey, crypted_key_it->second, reserved_counter)) return false;
+bool DescriptorScriptPubKeyMan::ReservePQCSignatureCountersBatch(const std::map<CPQCPubKey, uint32_t>& counts, std::map<CPQCPubKey, PQCSignatureCounterRange>& ranges) const
+{
+    ranges.clear();
+    if (counts.empty()) return false;
+    for (const auto& [_, count] : counts) {
+        if (count == 0 || count > PQC_MAX_SIGNATURES) return false;
     }
 
-    counter_it->second = reserved_counter;
+    struct CryptedPQCUpdate {
+        CPQCPubKey pubkey;
+        uint256 auth_tag;
+    };
+
+    std::map<CPQCPubKey, PQCSignatureCounterRange> reserved_ranges;
+    std::vector<CryptedPQCUpdate> crypted_updates;
+    LOCK(cs_desc_man);
+
+    for (const auto& [pubkey, count] : counts) {
+        if (IsPlaintextPQCKeyBlocked(pubkey)) return false;
+
+        const auto key_it = m_map_pqc_keys.find(pubkey);
+        const auto crypted_key_it = m_map_crypted_pqc_keys.find(pubkey);
+        if (key_it == m_map_pqc_keys.end() && crypted_key_it == m_map_crypted_pqc_keys.end()) return false;
+
+        const auto counter_it = m_map_pqc_sig_counters.find(pubkey);
+        if (counter_it == m_map_pqc_sig_counters.end()) return false;
+        if (counter_it->second > PQC_MAX_SIGNATURES - count) return false;
+
+        reserved_ranges.emplace(pubkey, PQCSignatureCounterRange{
+            .pubkey = pubkey,
+            .previous_counter = counter_it->second,
+            .reserved_counter = counter_it->second + count,
+        });
+    }
+
+    const uint256 desc_id{m_wallet_descriptor.id};
+
+    for (const auto& [pubkey, range] : reserved_ranges) {
+        const auto crypted_key_it = m_map_crypted_pqc_keys.find(pubkey);
+        if (crypted_key_it == m_map_crypted_pqc_keys.end()) continue;
+
+        uint256 auth_tag;
+        if (!m_storage.WithEncryptionKey([&](const CKeyingMaterial& encryption_key) {
+                CKeyingMaterial secret;
+                if (!DecryptSecret(encryption_key, crypted_key_it->second.crypted_secret, GetPQCKeyIV(pubkey), secret) || secret.size() != CPQCKey::SIZE) {
+                    return false;
+                }
+                auth_tag = GetCryptedPQCKeyAuthTag(encryption_key, desc_id, pubkey, std::span<const unsigned char>{secret.data(), secret.size()}, range.reserved_counter);
+                return true;
+            })) {
+            return false;
+        }
+        crypted_updates.push_back(CryptedPQCUpdate{pubkey, auth_tag});
+    }
+
+    WalletBatch batch(m_storage.GetDatabase());
+    if (!batch.TxnBegin()) return false;
+
+    for (const auto& [pubkey, range] : reserved_ranges) {
+        if (const auto key_it = m_map_pqc_keys.find(pubkey); key_it != m_map_pqc_keys.end()) {
+            if (!batch.WriteDescriptorPQCKey(desc_id, pubkey, key_it->second, range.reserved_counter)) {
+                batch.TxnAbort();
+                return false;
+            }
+            continue;
+        }
+
+        const auto crypted_key_it = m_map_crypted_pqc_keys.find(pubkey);
+        const CryptedPQCUpdate* update{nullptr};
+        for (const auto& crypted_update : crypted_updates) {
+            if (crypted_update.pubkey == pubkey) {
+                update = &crypted_update;
+                break;
+            }
+        }
+        if (crypted_key_it == m_map_crypted_pqc_keys.end() || update == nullptr) {
+            batch.TxnAbort();
+            return false;
+        }
+
+        if (!batch.WriteCryptedDescriptorPQCKey(desc_id, pubkey, crypted_key_it->second.crypted_secret, range.reserved_counter, &update->auth_tag)) {
+            batch.TxnAbort();
+            return false;
+        }
+    }
+
+    if (!batch.TxnCommit()) {
+        batch.TxnAbort();
+        return false;
+    }
+
+    for (const auto& [pubkey, range] : reserved_ranges) {
+        m_map_pqc_sig_counters[pubkey] = range.reserved_counter;
+    }
+    for (const auto& update : crypted_updates) {
+        if (auto crypted_key_it = m_map_crypted_pqc_keys.find(update.pubkey); crypted_key_it != m_map_crypted_pqc_keys.end()) {
+            crypted_key_it->second.auth_tag = update.auth_tag;
+        }
+    }
+
+    ranges = std::move(reserved_ranges);
     return true;
 }
 
@@ -1844,6 +2185,19 @@ PQCSignatureCounterReserver DescriptorScriptPubKeyMan::MakePQCSignatureCounterRe
         return storage->WithWalletLock([&] {
             if (!lifetime.lock()) return false;
             return self->ReservePQCSignatureCounters(pubkey, count, previous_counter, reserved_counter);
+        });
+    };
+}
+
+PQCSignatureCounterBatchReserver DescriptorScriptPubKeyMan::MakePQCSignatureCounterBatchReserver() const
+{
+    const std::weak_ptr<void> lifetime{m_lifetime};
+    const DescriptorScriptPubKeyMan* self{this};
+    WalletStorage* storage{&m_storage};
+    return [self, storage, lifetime](const std::map<CPQCPubKey, uint32_t>& counts, std::map<CPQCPubKey, PQCSignatureCounterRange>& ranges) {
+        return storage->WithWalletLock([&] {
+            if (!lifetime.lock()) return false;
+            return self->ReservePQCSignatureCountersBatch(counts, ranges);
         });
     };
 }
@@ -1868,15 +2222,125 @@ std::unique_ptr<SigningProvider> DescriptorScriptPubKeyMan::GetSigningProviderFo
 {
     std::unique_ptr<FlatSigningProvider> keys = std::make_unique<FlatSigningProvider>();
     bool has_provider_data{false};
-    for (const auto& coin_pair : coins) {
-        std::unique_ptr<FlatSigningProvider> coin_keys = GetSigningProvider(coin_pair.second.out.scriptPubKey, true, pqc_counter_observer);
-        if (!coin_keys) {
-            continue;
+    std::vector<int32_t> provider_indices;
+    std::set<int32_t> seen_indices;
+    std::shared_ptr<Descriptor> descriptor;
+    uint256 desc_id;
+    bool have_private_keys{false};
+    bool has_encryption_keys{false};
+    KeyMap private_keys;
+    CryptedKeyMap crypted_keys;
+    PQCKeyMap pqc_keys;
+    CryptedPQCKeyMap crypted_pqc_keys;
+    std::map<CPQCPubKey, uint32_t> pqc_sig_counters;
+    std::set<CPQCPubKey> blocked_pqc_keys;
+
+    {
+        LOCK(cs_desc_man);
+        desc_id = m_wallet_descriptor.id;
+        descriptor = m_wallet_descriptor.descriptor;
+
+        for (const auto& coin_pair : coins) {
+            const auto script_it = m_map_script_pub_keys.find(coin_pair.second.out.scriptPubKey);
+            if (script_it == m_map_script_pub_keys.end()) continue;
+
+            const int32_t index{script_it->second};
+            if (!seen_indices.insert(index).second) continue;
+
+            FlatSigningProvider index_keys;
+            auto provider_it = m_map_signing_providers.find(index);
+            if (provider_it != m_map_signing_providers.end()) {
+                index_keys = provider_it->second;
+            } else {
+                std::vector<CScript> scripts_temp;
+                if (!descriptor->ExpandFromCache(index, m_wallet_descriptor.cache, scripts_temp, index_keys)) continue;
+                m_map_signing_providers[index] = index_keys;
+            }
+
+            keys->Merge(std::move(index_keys));
+            provider_indices.push_back(index);
+            has_provider_data = true;
         }
-        keys->Merge(std::move(*coin_keys));
-        has_provider_data = true;
+
+        if (!has_provider_data) return nullptr;
+
+        have_private_keys = !m_map_keys.empty() || !m_map_crypted_keys.empty() || !m_map_pqc_keys.empty() || !m_map_crypted_pqc_keys.empty();
+        if (have_private_keys) {
+            blocked_pqc_keys = GetBlockedPlaintextPQCKeys();
+            has_encryption_keys = m_storage.HasEncryptionKeys();
+            private_keys = m_map_keys;
+            crypted_keys = m_map_crypted_keys;
+            pqc_keys = m_map_pqc_keys;
+            for (auto it = pqc_keys.begin(); it != pqc_keys.end();) {
+                if (blocked_pqc_keys.contains(it->first)) {
+                    it = pqc_keys.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            crypted_pqc_keys = m_map_crypted_pqc_keys;
+            for (auto it = crypted_pqc_keys.begin(); it != crypted_pqc_keys.end();) {
+                if (blocked_pqc_keys.contains(it->first)) {
+                    it = crypted_pqc_keys.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            pqc_sig_counters = m_map_pqc_sig_counters;
+        }
     }
-    if (!has_provider_data) return nullptr;
+
+    if (!have_private_keys) {
+        keys->pqc_counter_observer = pqc_counter_observer;
+        return keys;
+    }
+
+    FlatSigningProvider master_provider;
+    master_provider.keys = std::move(private_keys);
+
+    // Build private providers after releasing cs_desc_man to preserve the wallet->descriptor lock order.
+    const bool encrypted_locked{has_encryption_keys && m_storage.IsLocked()};
+    if (encrypted_locked) {
+        pqc_keys.clear();
+        pqc_sig_counters.clear();
+    }
+    if (has_encryption_keys && !encrypted_locked) {
+        m_storage.WithEncryptionKey([&](const CKeyingMaterial& encryption_key) {
+            for (const auto& [_, key_pair] : crypted_keys) {
+                const CPubKey& pubkey = key_pair.first;
+                const std::vector<unsigned char>& crypted_secret = key_pair.second;
+                CKey key;
+                if (!DecryptKey(encryption_key, crypted_secret, pubkey, key)) {
+                    continue;
+                }
+                master_provider.keys[pubkey.GetID()] = key;
+            }
+            for (const auto& [pubkey, crypted_key] : crypted_pqc_keys) {
+                CPQCKey key;
+                const auto counter_it{pqc_sig_counters.find(pubkey)};
+                const uint32_t sig_counter{counter_it != pqc_sig_counters.end() ? counter_it->second : 0};
+                if (!DecryptPQCKey(encryption_key, desc_id, crypted_key, pubkey, sig_counter, key)) {
+                    continue;
+                }
+                pqc_keys[pubkey] = key;
+            }
+            return true;
+        });
+    }
+
+    for (const int32_t index : provider_indices) {
+        descriptor->ExpandPrivate(index, master_provider, *keys);
+    }
+    keys->pqc_keys.insert(pqc_keys.begin(), pqc_keys.end());
+    keys->pqc_sig_counters.insert(pqc_sig_counters.begin(), pqc_sig_counters.end());
+    for (const CPQCPubKey& pubkey : blocked_pqc_keys) {
+        keys->pqc_keys.erase(pubkey);
+        keys->pqc_sig_counters.erase(pubkey);
+    }
+    keys->pqc_counter_reserver = MakePQCSignatureCounterReserver();
+    keys->pqc_counter_batch_reserver = MakePQCSignatureCounterBatchReserver();
+    keys->pqc_counter_observer = pqc_counter_observer;
+
     return keys;
 }
 
@@ -1923,6 +2387,120 @@ SigningResult DescriptorScriptPubKeyMan::SignMessage(const std::string& message,
         return SigningResult::SIGNING_FAILED;
     }
     return SigningResult::OK;
+}
+
+static const std::vector<unsigned char>* FindValidP2MRDataProofControlBlock(
+    const std::set<std::vector<unsigned char>, ShortestVectorFirstComparator>& control_blocks,
+    std::span<const unsigned char> script_bytes,
+    int leaf_version,
+    const WitnessV2P2MR& output,
+    const std::optional<std::vector<unsigned char>>& requested_control_block)
+{
+    if (leaf_version < 0 || leaf_version > 0xff) return nullptr;
+
+    const uint256 leaf_hash = ComputeP2MRLeafHash(static_cast<uint8_t>(leaf_version), script_bytes);
+    for (const auto& control_block : control_blocks) {
+        if (requested_control_block && control_block != *requested_control_block) continue;
+        if (control_block.size() < P2MR_CONTROL_BASE_SIZE || control_block.size() > P2MR_CONTROL_MAX_SIZE ||
+            ((control_block.size() - P2MR_CONTROL_BASE_SIZE) % P2MR_CONTROL_NODE_SIZE) != 0) {
+            continue;
+        }
+        if ((control_block.front() & 1) == 0) continue;
+        if ((control_block.front() & TAPROOT_LEAF_MASK) != leaf_version) continue;
+        if (ComputeP2MRMerkleRoot(control_block, leaf_hash) != output.GetMerkleRoot()) continue;
+        return &control_block;
+    }
+    return nullptr;
+}
+
+util::Result<DataPQCSignatureProof> SignP2MRDataHash(
+    const SigningProvider& provider,
+    const WitnessV2P2MR& output,
+    const uint256& message_hash,
+    const std::optional<CPQCPubKey>& requested_pubkey,
+    const std::optional<CScript>& requested_leaf_script,
+    const std::optional<std::vector<unsigned char>>& requested_control_block)
+{
+    P2MRSpendData spenddata;
+    TaprootBuilder builder;
+    if (provider.GetP2MRSpendData(output, spenddata)) {
+        // Already populated.
+    } else if (provider.GetP2MRBuilder(output, builder)) {
+        spenddata.Merge(builder.GetP2MRSpendData());
+    }
+
+    if (spenddata.scripts.empty()) {
+        return util::Error{_("P2MR spend data is not available for this address")};
+    }
+
+    bool found_matching_leaf{false};
+    bool found_signable_key{false};
+    bool signing_failed{false};
+    const std::vector<unsigned char> requested_leaf_bytes = requested_leaf_script ?
+        std::vector<unsigned char>{requested_leaf_script->begin(), requested_leaf_script->end()} :
+        std::vector<unsigned char>{};
+    const uint256 datasig_hash = ComputeQbitDataSigPQCHash(std::span<const unsigned char>{message_hash.begin(), message_hash.end()});
+
+    for (const auto& [key, control_blocks] : spenddata.scripts) {
+        const auto& [script_bytes, leaf_version] = key;
+        if (leaf_version != P2MR_LEAF_VERSION_V1) continue;
+        if (requested_leaf_script && script_bytes != requested_leaf_bytes) continue;
+
+        const CScript leaf_script{script_bytes.begin(), script_bytes.end()};
+        const std::optional<CPQCPubKey> pubkey = p2mr::MatchPK(leaf_script);
+        if (!pubkey) continue;
+        if (requested_pubkey && *pubkey != *requested_pubkey) continue;
+
+        const std::vector<unsigned char>* control_block = FindValidP2MRDataProofControlBlock(
+            control_blocks, script_bytes, leaf_version, output, requested_control_block);
+        if (!control_block) continue;
+
+        found_matching_leaf = true;
+        if (!provider.CanSignPQC(*pubkey)) continue;
+        found_signable_key = true;
+
+        std::vector<unsigned char> signature;
+        if (!provider.SignPQC(*pubkey, datasig_hash, signature)) {
+            signing_failed = true;
+            continue;
+        }
+
+        DataPQCSignatureProof proof;
+        proof.output = output;
+        proof.message_hash = message_hash;
+        proof.datasig_hash = datasig_hash;
+        proof.pubkey = *pubkey;
+        proof.signature = std::move(signature);
+        proof.leaf_script = leaf_script;
+        proof.control_block = *control_block;
+        proof.leaf_version = static_cast<uint8_t>(leaf_version);
+        return proof;
+    }
+
+    if (found_matching_leaf && !found_signable_key) {
+        return util::Error{_("Private key is not available for the selected P2MR pubkey leaf")};
+    }
+    if (signing_failed) {
+        return util::Error{_("PQC data-hash signing failed")};
+    }
+    return util::Error{_("No supported single-key P2MR pubkey leaf was found for this address")};
+}
+
+util::Result<DataPQCSignatureProof> DescriptorScriptPubKeyMan::SignDataPQCHash(
+    const WitnessV2P2MR& output,
+    const uint256& message_hash,
+    const std::optional<CPQCPubKey>& requested_pubkey,
+    const std::optional<CScript>& requested_leaf_script,
+    const std::optional<std::vector<unsigned char>>& requested_control_block,
+    const PQCSignatureCounterObserver& pqc_counter_observer) const
+{
+    const CScript script_pub_key = GetScriptForDestination(output);
+    std::unique_ptr<FlatSigningProvider> provider = GetSigningProvider(script_pub_key, /*include_private=*/true, pqc_counter_observer);
+    if (!provider) {
+        return util::Error{_("P2MR address is not available in this wallet")};
+    }
+
+    return SignP2MRDataHash(*provider, output, message_hash, requested_pubkey, requested_leaf_script, requested_control_block);
 }
 
 std::unique_ptr<FlatSigningProvider> DescriptorScriptPubKeyMan::GetSigningProviderForPSBTInput(const CScript& script, const PSBTInput& input, bool sign, const PQCSignatureCounterObserver& pqc_counter_observer) const
@@ -2096,7 +2674,8 @@ std::unique_ptr<CKeyMetadata> DescriptorScriptPubKeyMan::GetMetadata(const CTxDe
 std::optional<uint32_t> DescriptorScriptPubKeyMan::GetPQCSignatureCounter(const CPQCPubKey& pubkey) const
 {
     LOCK(cs_desc_man);
-    const bool have_local_key = m_map_pqc_keys.contains(pubkey) || m_map_crypted_pqc_keys.contains(pubkey);
+    const bool have_local_key = m_map_pqc_keys.contains(pubkey) || m_map_crypted_pqc_keys.contains(pubkey) ||
+                                m_pending_plaintext_pqc_keys.contains(pubkey) || m_failed_plaintext_pqc_keys.contains(pubkey);
     if (!have_local_key) {
         return std::nullopt;
     }
@@ -2175,14 +2754,62 @@ bool DescriptorScriptPubKeyMan::AddPQCKey(const CPQCPubKey& pubkey, const CPQCKe
     return true;
 }
 
-bool DescriptorScriptPubKeyMan::AddCryptedPQCKey(const CPQCPubKey& pubkey, const std::vector<unsigned char>& crypted_key, uint32_t sig_counter)
+bool DescriptorScriptPubKeyMan::AddPendingPlaintextPQCKey(const CPQCPubKey& pubkey, CKeyingMaterial secret, uint32_t sig_counter)
+{
+    LOCK(cs_desc_man);
+    if (m_map_pqc_keys.contains(pubkey) || m_pending_plaintext_pqc_keys.contains(pubkey)) {
+        return false;
+    }
+    m_failed_plaintext_pqc_keys.erase(pubkey);
+    m_pending_plaintext_pqc_keys.emplace(pubkey, PendingPlaintextPQCKey{std::move(secret), sig_counter});
+    m_map_pqc_sig_counters[pubkey] = sig_counter;
+    return true;
+}
+
+std::optional<std::pair<CPQCPubKey, PendingPlaintextPQCKey>> DescriptorScriptPubKeyMan::GetNextPendingPlaintextPQCKey() const
+{
+    LOCK(cs_desc_man);
+    if (m_pending_plaintext_pqc_keys.empty()) return std::nullopt;
+    const auto& [pubkey, pending_key] = *m_pending_plaintext_pqc_keys.begin();
+    return std::make_pair(pubkey, pending_key);
+}
+
+bool DescriptorScriptPubKeyMan::CompletePendingPlaintextPQCKeyValidation(const CPQCPubKey& pubkey, const CPQCKey& key, uint32_t sig_counter)
+{
+    LOCK(cs_desc_man);
+    const auto pending_it = m_pending_plaintext_pqc_keys.find(pubkey);
+    if (pending_it == m_pending_plaintext_pqc_keys.end()) {
+        return false;
+    }
+    if (!m_map_crypted_pqc_keys.contains(pubkey)) {
+        m_map_pqc_keys[pubkey] = key;
+        m_map_pqc_sig_counters[pubkey] = sig_counter;
+    }
+    m_pending_plaintext_pqc_keys.erase(pending_it);
+    m_failed_plaintext_pqc_keys.erase(pubkey);
+    return true;
+}
+
+bool DescriptorScriptPubKeyMan::FailPendingPlaintextPQCKeyValidation(const CPQCPubKey& pubkey)
+{
+    LOCK(cs_desc_man);
+    const auto pending_it = m_pending_plaintext_pqc_keys.find(pubkey);
+    if (pending_it == m_pending_plaintext_pqc_keys.end()) {
+        return false;
+    }
+    m_pending_plaintext_pqc_keys.erase(pending_it);
+    m_failed_plaintext_pqc_keys.insert(pubkey);
+    return true;
+}
+
+bool DescriptorScriptPubKeyMan::AddCryptedPQCKey(const CPQCPubKey& pubkey, const std::vector<unsigned char>& crypted_key, uint32_t sig_counter, std::optional<uint256> auth_tag)
 {
     LOCK(cs_desc_man);
     if (!m_map_pqc_keys.empty()) {
         return false;
     }
 
-    m_map_crypted_pqc_keys[pubkey] = crypted_key;
+    m_map_crypted_pqc_keys[pubkey] = CryptedPQCKeyRecord{crypted_key, auth_tag};
     m_map_pqc_sig_counters[pubkey] = sig_counter;
     return true;
 }
@@ -2191,11 +2818,15 @@ std::vector<CPQCPubKey> DescriptorScriptPubKeyMan::GetPQCKeys() const
 {
     LOCK(cs_desc_man);
     std::vector<CPQCPubKey> keys;
-    keys.reserve(m_map_pqc_keys.size() + m_map_crypted_pqc_keys.size());
+    keys.reserve(m_map_pqc_keys.size() + m_map_crypted_pqc_keys.size() + m_pending_plaintext_pqc_keys.size());
     for (const auto& [pubkey, _] : m_map_pqc_keys) {
         keys.push_back(pubkey);
     }
     for (const auto& [pubkey, _] : m_map_crypted_pqc_keys) {
+        keys.push_back(pubkey);
+    }
+    for (const auto& [pubkey, _] : m_pending_plaintext_pqc_keys) {
+        if (m_map_pqc_keys.contains(pubkey) || m_map_crypted_pqc_keys.contains(pubkey)) continue;
         keys.push_back(pubkey);
     }
     return keys;

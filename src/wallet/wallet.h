@@ -19,6 +19,7 @@
 #include <script/interpreter.h>
 #include <script/p2mr_sizing.h>
 #include <script/script.h>
+#include <script/signingprogress.h>
 #include <support/allocators/secure.h>
 #include <sync.h>
 #include <tinyformat.h>
@@ -59,6 +60,7 @@
 class CKey;
 class CKeyID;
 class CPubKey;
+class CScheduler;
 class Coin;
 class SigningProvider;
 enum class MemPoolRemovalReason;
@@ -103,6 +105,8 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
 std::shared_ptr<CWallet> RestoreWallet(WalletContext& context, const fs::path& backup_file, const std::string& wallet_name, std::optional<bool> load_on_start, DatabaseStatus& status, bilingual_str& error, std::vector<bilingual_str>& warnings, bool load_after_restore = true);
 std::unique_ptr<interfaces::Handler> HandleLoadWallet(WalletContext& context, LoadWalletFn load_wallet);
 void NotifyWalletLoaded(WalletContext& context, const std::shared_ptr<CWallet>& wallet);
+void SchedulePlaintextPQCKeyValidation(CScheduler& scheduler, const std::shared_ptr<CWallet>& wallet);
+void MaybeScheduleP2MRKeyPoolRefill(WalletContext& context, const std::shared_ptr<CWallet>& wallet, OutputType type, bool internal);
 std::unique_ptr<WalletDatabase> MakeWalletDatabase(const std::string& name, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error);
 
 //! -paytxfee default
@@ -133,8 +137,6 @@ static const bool DEFAULT_SPEND_ZEROCONF_CHANGE = true;
 static const bool DEFAULT_WALLET_REJECT_LONG_CHAINS{true};
 //! -txconfirmtarget default
 static const unsigned int DEFAULT_TX_CONFIRM_TARGET = 6;
-//! Fresh P2MR wallets only need a few addresses immediately; refill the rest after creation.
-static constexpr unsigned int DEFAULT_CREATE_WALLET_P2MR_WARM_KEYPOOL = 16;
 //! -walletrbf default
 static const bool DEFAULT_WALLET_RBF = true;
 static const bool DEFAULT_WALLETBROADCAST = true;
@@ -234,7 +236,7 @@ public:
     }
 
     //! Reserve an address
-    util::Result<CTxDestination> GetReservedDestination(bool internal);
+    util::Result<CTxDestination> GetReservedDestination(bool internal, bool allow_internal_p2mr_refill = true);
     //! Return reserved address
     void ReturnDestination();
     //! Keep the address. Do not return its key to the keypool when this object goes out of scope
@@ -662,6 +664,7 @@ public:
     mutable std::condition_variable m_active_signing_cv;
     mutable size_t m_active_signing_provider_snapshots{0};
     mutable bool m_block_signing_provider_snapshots{false};
+    bool m_plaintext_pqc_key_validation_running GUARDED_BY(cs_wallet){false};
 
     bool Unlock(const SecureString& strWalletPassphrase, bool run_pending_initial_keypool_top_up = true);
     bool ChangeWalletPassphrase(const SecureString& strOldWalletPassphrase, const SecureString& strNewWalletPassphrase);
@@ -724,10 +727,17 @@ public:
     OutputType TransactionChangeType(const std::optional<OutputType>& change_type, const std::vector<CRecipient>& vecSend) const;
 
     /** Fetch the inputs and sign with SIGHASH_ALL. */
-    bool SignTransaction(CMutableTransaction& tx, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const;
+    bool SignTransaction(CMutableTransaction& tx, const PQCSignatureCounterObserver& pqc_counter_observer = {}, const SigningProgressCallback& progress_callback = {}) const;
     /** Sign the tx given the input coins and sighash. */
-    bool SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors, const PQCSignatureCounterObserver& pqc_counter_observer = {}) const;
+    bool SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors, const PQCSignatureCounterObserver& pqc_counter_observer = {}, const SigningProgressCallback& progress_callback = {}) const;
     SigningResult SignMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) const;
+    util::Result<DataPQCSignatureProof> SignDataPQCHash(
+        const WitnessV2P2MR& output,
+        const uint256& message_hash,
+        const std::optional<CPQCPubKey>& requested_pubkey = std::nullopt,
+        const std::optional<CScript>& requested_leaf_script = std::nullopt,
+        const std::optional<std::vector<unsigned char>>& requested_control_block = std::nullopt,
+        const PQCSignatureCounterObserver& pqc_counter_observer = {}) const;
 
     /**
      * Fills out a PSBT with information from the wallet. Fills in UTXOs if we have
@@ -811,6 +821,8 @@ public:
 
     /** Number of pre-generated keys/scripts by each spkm (part of the look-ahead process, used to detect payments) */
     int64_t m_keypool_size{DEFAULT_KEYPOOL_SIZE};
+    bool m_p2mr_receive_keypool_refill_scheduled GUARDED_BY(cs_wallet){false};
+    bool m_p2mr_change_keypool_refill_scheduled GUARDED_BY(cs_wallet){false};
 
     /** Notify external script when a wallet transaction comes in or is updated (handled by -walletnotify) */
     std::string m_notify_tx_changed_script;
@@ -826,6 +838,21 @@ public:
     };
     PendingInitialKeyPoolTopUpStepResult RunPendingInitialKeyPoolTopUpStep();
     bool RunPendingInitialKeyPoolTopUp();
+    enum class P2MRKeyPoolRefillStepResult {
+        COMPLETE,
+        PENDING,
+        FAILED,
+    };
+    P2MRKeyPoolRefillStepResult RunP2MRKeyPoolRefillStep(bool internal);
+
+    enum class PlaintextPQCKeyValidationStepResult {
+        COMPLETE,
+        IN_PROGRESS,
+        FAILED,
+    };
+    PQCKeyValidationInfo GetPQCKeyValidationInfo() const;
+    PlaintextPQCKeyValidationStepResult RunPlaintextPQCKeyValidationStep();
+    bool IsPQCKeyValidationReadyForPrivateKeyUse() const;
 
     // Filter struct for 'ListAddrBookAddresses'
     struct AddrBookFilter {
@@ -859,7 +886,7 @@ public:
     void MarkDestinationsDirty(const std::set<CTxDestination>& destinations) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     util::Result<CTxDestination> GetNewDestination(const OutputType type, const std::string label);
-    util::Result<CTxDestination> GetNewChangeDestination(const OutputType type);
+    util::Result<CTxDestination> GetNewChangeDestination(const OutputType type, bool allow_internal_p2mr_refill = true);
 
     bool IsMine(const CTxDestination& dest) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool IsMine(const CScript& script) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
