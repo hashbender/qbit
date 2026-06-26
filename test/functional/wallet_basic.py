@@ -63,6 +63,13 @@ class WalletTest(BitcoinTestFramework):
         """Scale historical 50 BTC-baseline test amounts to the active subsidy."""
         return (Decimal(str(amount)) * self.subsidy_scale).quantize(Decimal("0.00000001"))
 
+    def wait_pqc_key_validation_ready(self, wallet):
+        def ready():
+            validation = wallet.getwalletinfo().get("pqc_key_validation", {})
+            return validation.get("status") in ("not_required", "complete") and not validation.get("signing_blocked", True)
+
+        self.wait_until(ready, timeout=180)
+
     def run_test(self):
 
         # Check that there's no UTXO on none of the nodes
@@ -167,6 +174,7 @@ class WalletTest(BitcoinTestFramework):
         # Unloading and reloading the wallet with a persistent lock should keep the lock
         self.nodes[2].unloadwallet(self.default_wallet_name)
         self.nodes[2].loadwallet(self.default_wallet_name)
+        self.wait_pqc_key_validation_ready(self.nodes[2])
         assert_raises_rpc_error(-8, "Invalid parameter, output already locked", self.nodes[2].lockunspent, False, [unspent_0])
 
         # Locked outputs should not be used, even if they are the only available funds
@@ -176,6 +184,7 @@ class WalletTest(BitcoinTestFramework):
         # Unlocking should remove the persistent lock
         self.nodes[2].lockunspent(True, [unspent_0])
         self.restart_node(2)
+        self.wait_pqc_key_validation_ready(self.nodes[2])
         assert_equal(len(self.nodes[2].listlockunspent()), 0)
 
         # Reconnect node 2 after restarts
@@ -306,7 +315,7 @@ class WalletTest(BitcoinTestFramework):
         assert_equal(self.nodes[0].getreceivedbyaddress(a0), expected_bal)
         assert_equal(self.nodes[0].getreceivedbyaddress(a1), expected_bal)
 
-        self.log.info("Test sendmany with fee_rate param (explicit fee rate in sat/vB)")
+        self.log.info("Test sendmany with fee_rate param (explicit fee rate in bits/vB)")
         fee_rate_sat_vb = 2
         fee_rate_btc_kvb = fee_rate_sat_vb * 1e3 / 1e8
         explicit_fee_rate_btc_kvb = Decimal(fee_rate_btc_kvb) / 1000
@@ -335,24 +344,24 @@ class WalletTest(BitcoinTestFramework):
         # Test setting explicit fee rate just below the current minimum.
         min_fee_rate_sat_vb = Decimal(str(self.nodes[2].getnetworkinfo()["relayfee"])) * Decimal("100000")
         low_fee_rate_sat_vb = (min_fee_rate_sat_vb - Decimal("0.001")).quantize(Decimal("0.00000001"))
-        self.log.info(f"Test sendmany raises 'fee rate too low' just below the minimum ({min_fee_rate_sat_vb:.3f} sat/vB)")
+        self.log.info(f"Test sendmany raises 'fee rate too low' just below the minimum ({min_fee_rate_sat_vb:.3f} bits/vB)")
         assert low_fee_rate_sat_vb > 0
         too_low_msg = (
-            f"Fee rate ({low_fee_rate_sat_vb:.3f} sat/vB) is lower than the minimum fee rate setting ({min_fee_rate_sat_vb:.3f} sat/vB)"
+            f"Fee rate ({low_fee_rate_sat_vb:.3f} bits/vB) is lower than the minimum fee rate setting ({min_fee_rate_sat_vb:.3f} bits/vB)"
         )
         assert_raises_rpc_error(-6, too_low_msg,
             self.nodes[2].sendmany, amounts={address: ten_btc}, fee_rate=str(low_fee_rate_sat_vb))
 
         self.log.info("Test sendmany raises if an invalid fee_rate is passed")
         # Test fee_rate with zero values.
-        msg = f"Fee rate (0.000 sat/vB) is lower than the minimum fee rate setting ({min_fee_rate_sat_vb:.3f} sat/vB)"
+        msg = f"Fee rate (0.000 bits/vB) is lower than the minimum fee rate setting ({min_fee_rate_sat_vb:.3f} bits/vB)"
         for zero_value in [0, 0.000, 0.00000000, "0", "0.000", "0.00000000"]:
             assert_raises_rpc_error(-6, msg, self.nodes[2].sendmany, amounts={address: five_btc}, fee_rate=zero_value)
         msg = "Invalid amount"
         # Test fee_rate values that don't pass fixed-point parsing checks.
         for invalid_value in ["", 0.000000001, 1e-09, 1.111111111, 1111111111111111, "31.999999999999999999999"]:
             assert_raises_rpc_error(-3, msg, self.nodes[2].sendmany, amounts={address: float(five_btc)}, fee_rate=invalid_value)
-        # Test fee_rate values that cannot be represented in sat/vB.
+        # Test fee_rate values that cannot be represented in bits/vB.
         for invalid_value in [0.0001, 0.00000001, 0.00099999, 31.99999999]:
             assert_raises_rpc_error(-3, msg, self.nodes[2].sendmany, amounts={address: ten_btc}, fee_rate=invalid_value)
         # Test fee_rate out of range (negative number).

@@ -18,6 +18,7 @@ class WalletPQCUsageTest(BitcoinTestFramework):
     def set_test_params(self):
         self.setup_clean_chain = True
         self.num_nodes = 1
+        self.extra_args = [["-walletpqcparallel=1", "-walletpqcsignthreads=0"]]
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
@@ -52,6 +53,7 @@ class WalletPQCUsageTest(BitcoinTestFramework):
 
     def fund_p2mr_utxo(self, funder, signer, amount=Decimal("5")):
         address = signer.getnewaddress(address_type="p2mr")
+        self.wait_pqc_key_validation_ready(funder)
         txid = funder.sendtoaddress(address, amount)
         self.generate(self.nodes[0], 1, sync_fun=self.no_op)
         for utxo in signer.listunspent(addresses=[address]):
@@ -91,6 +93,13 @@ class WalletPQCUsageTest(BitcoinTestFramework):
         assert_equal(info["pqc_signature_count"], expected_count)
         return info
 
+    def wait_pqc_key_validation_ready(self, wallet):
+        def ready():
+            validation = wallet.getwalletinfo().get("pqc_key_validation", {})
+            return validation.get("status") in ("not_required", "complete") and not validation.get("signing_blocked", True)
+
+        self.wait_until(ready, timeout=180)
+
     def create_raw_spend(self, utxos, destination, fee=None):
         if isinstance(utxos, dict):
             utxos = [utxos]
@@ -104,6 +113,7 @@ class WalletPQCUsageTest(BitcoinTestFramework):
 
     def sign_and_broadcast_raw(self, signer, utxos, destination):
         raw = self.create_raw_spend(utxos, destination)
+        self.wait_pqc_key_validation_ready(signer)
         signed = signer.signrawtransactionwithwallet(raw)
         assert_equal(signed["complete"], True)
         txid = self.nodes[0].sendrawtransaction(signed["hex"])
@@ -224,6 +234,7 @@ class WalletPQCUsageTest(BitcoinTestFramework):
         assert_equal(load_result["name"], wallet_name)
         signer = self.nodes[0].get_wallet_rpc(wallet_name)
         self.assert_pqc_signature_count(signer, tracked_address, 2)
+        self.wait_pqc_key_validation_ready(signer)
 
         remaining_utxos = signer.listunspent(addresses=[tracked_address])
         assert_equal(len(remaining_utxos), 1)
@@ -297,6 +308,7 @@ class WalletPQCUsageTest(BitcoinTestFramework):
         self.test_counter_lifecycle(funder, receiver)
         funder = self.nodes[0].get_wallet_rpc("pqc_funder")
         receiver = self.nodes[0].get_wallet_rpc("pqc_receiver")
+        self.wait_pqc_key_validation_ready(funder)
         self.test_descriptor_recovery_counter_reset(funder, receiver)
 
 

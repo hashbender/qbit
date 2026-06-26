@@ -173,7 +173,7 @@ def validate_release_metadata(
     if values["source_commit"] != source_commit:
         raise TestnetPostureError(
             f"Testnet release posture evidence source_commit={values['source_commit']!r}, "
-            f"expected {source_commit!r}"
+            f"expected public tag target {source_commit!r}"
         )
 
 
@@ -643,7 +643,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-root", default=REPO_ROOT, type=Path)
     parser.add_argument(
         "--release-tag",
-        help="release tag whose peeled commit must match evidence and source checks",
+        help="release tag whose peeled public target commit must match evidence and source checks",
     )
     parser.add_argument(
         "--artifacts-dir",
