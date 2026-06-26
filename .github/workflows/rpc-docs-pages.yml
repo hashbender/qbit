@@ -33,7 +33,7 @@ defaults:
 jobs:
   build:
     name: build rpc docs site
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     timeout-minutes: 45
 
     steps:
@@ -141,7 +141,7 @@ jobs:
     name: deploy rpc docs pages
     needs: build
     if: ${{ inputs.publish }}
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     permissions:
       pages: write
       id-token: write
