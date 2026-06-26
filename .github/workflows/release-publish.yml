@@ -95,7 +95,9 @@ defaults:
 jobs:
   publish:
     name: publish release
-    runs-on: [self-hosted, linux, x64]
+    runs-on:
+             - self-hosted
+             - tenki-standard-medium-4c-8g
     timeout-minutes: 60
     steps:
       - name: Validate tag exists and is GitHub-verified
