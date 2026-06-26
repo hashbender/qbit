@@ -32,7 +32,7 @@ defaults:
 jobs:
   build-smoke:
     name: build smoke
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     timeout-minutes: 45
 
     steps:
@@ -77,7 +77,7 @@ jobs:
 
   focused-unit-suites:
     name: focused unit suites
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     timeout-minutes: 75
 
     steps:
@@ -133,7 +133,7 @@ jobs:
 
   functional-smoke:
     name: functional smoke
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     timeout-minutes: 90
 
     steps:
@@ -190,7 +190,7 @@ jobs:
 
   release-validator-tests:
     name: release validator tests
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     timeout-minutes: 20
 
     steps:
@@ -292,7 +292,7 @@ jobs:
 
   core-checks-gate:
     name: 'Core Checks Gate'
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     needs:
       - build-smoke
       - focused-unit-suites

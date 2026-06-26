@@ -55,7 +55,7 @@ jobs:
     # self-hosted pool. The same workflow then runs full validation in both with
     # no per-repo edits. Fork-PR safety is enforced separately by the trust-gate
     # `if:` conditions, independent of the runner pool.
-    runs-on: &qbit_runs_on ${{ github.repository == 'Qbit-Org/qbit' && fromJSON('["self-hosted", "linux", "x64", "qbit-trusted-ci"]') || fromJSON('["self-hosted", "linux", "x64"]') }}
+    runs-on: &qbit_runs_on tenki-standard-large-plus-16c-32g
     outputs:
       provider: ${{ steps.runners.outputs.provider }}
     steps:
@@ -127,7 +127,7 @@ jobs:
 
   macos-native-arm64:
     name: ${{ matrix.job-name }}
-    runs-on: macos-14
+    runs-on: tenki-standard-medium-4c-8g
     if: false # Disabled: no macOS runner available
 
     timeout-minutes: 120
@@ -204,7 +204,7 @@ jobs:
 
   windows-native-dll:
     name: ${{ matrix.job-name }}
-    runs-on: blacksmith-8vcpu-windows-2025
+    runs-on: tenki-standard-medium-4c-8g
     if: ${{ github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted'))) }}
     timeout-minutes: 240
 
@@ -530,7 +530,7 @@ jobs:
 
   windows-native-test:
     name: 'Windows, test cross-built'
-    runs-on: blacksmith-8vcpu-windows-2025
+    runs-on: tenki-standard-medium-4c-8g
     needs: windows-cross
     # Defense-in-depth parity with windows-native-dll: never execute on the
     # third-party Windows runner for untrusted fork PRs. success() preserves the
@@ -763,7 +763,7 @@ jobs:
 
   public-docs-lint:
     name: 'public-docs-lint'
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft != true }}
     timeout-minutes: 10
     steps:
@@ -778,7 +778,7 @@ jobs:
 
   rpc-docs:
     name: 'rpc-docs'
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft != true }}
     timeout-minutes: 45
 
@@ -869,7 +869,7 @@ jobs:
 
   full-validation-gate:
     name: 'Full Validation Gate'
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     needs:
       - runners
       - windows-native-dll
