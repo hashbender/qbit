@@ -94,7 +94,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event_name == 'schedule' && 'develop' || github.ref }}
+          ref: ${{ github.event_name == 'schedule' && '0.1.x' || github.ref }}
           fetch-depth: 0
 
       - name: Configure environment
@@ -128,7 +128,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event_name == 'schedule' && 'develop' || github.ref }}
+          ref: ${{ github.event_name == 'schedule' && '0.1.x' || github.ref }}
           fetch-depth: 0
 
       - name: Install scanner tools
