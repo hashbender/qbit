@@ -1,0 +1,664 @@
+# Copyright (c) 2026-present The qbit core developers
+# Distributed under the MIT software license, see the accompanying
+# file COPYING or https://opensource.org/license/mit.
+
+name: Required Merge Gate
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - labeled
+      - unlabeled
+    branches:
+      - main
+      - 0.1.x
+      - develop
+  push:
+    branches:
+      - main
+      - 0.1.x
+      - develop
+  merge_group:
+    branches:
+      - main
+      - 0.1.x
+      - develop
+
+permissions:
+  contents: read
+  checks: read
+
+concurrency:
+  group: required-merge-gate-${{ github.event_name != 'pull_request' && github.run_id || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  classify-changes:
+    name: classify validation profile
+    runs-on: tenki-standard-medium-4c-8g
+    outputs:
+      profile: ${{ steps.classify.outputs.profile }}
+      release_policy_only: ${{ steps.classify.outputs.release_policy_only }}
+      rpc_docs_only: ${{ steps.classify.outputs.rpc_docs_only }}
+      public_docs_only: ${{ steps.classify.outputs.public_docs_only }}
+      github_metadata_only: ${{ steps.classify.outputs.github_metadata_only }}
+      source_validation_required: ${{ steps.classify.outputs.source_validation_required }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Write changed file list
+        id: changed-files
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref || github.event.merge_group.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+        run: |
+          set -euo pipefail
+
+          changed_files="${RUNNER_TEMP}/changed-files.txt"
+          : > "${changed_files}"
+
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            if [[ -z "${BASE_SHA}" ]]; then
+              echo "::error::Pull request base SHA is unavailable."
+              exit 1
+            fi
+            git diff --name-only "${BASE_SHA}...HEAD" > "${changed_files}"
+          elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
+            base_branch="${BASE_REF#refs/heads/}"
+            if [[ -z "${base_branch}" ]]; then
+              echo "::error::Merge-group base branch is unavailable."
+              exit 1
+            fi
+            git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
+            git diff --name-only "origin/${base_branch}...HEAD" > "${changed_files}"
+          elif [[ "${EVENT_NAME}" == "push" ]]; then
+            if [[ -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
+              git diff --name-only "${BEFORE_SHA}..HEAD" > "${changed_files}"
+            else
+              git fetch --no-tags --prune origin "${DEFAULT_BRANCH}"
+              merge_base="$(git merge-base "origin/${DEFAULT_BRANCH}" HEAD 2>/dev/null || true)"
+              if [[ -n "${merge_base}" ]]; then
+                git diff --name-only "${merge_base}...HEAD" > "${changed_files}"
+              else
+                git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
+              fi
+            fi
+          else
+            git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
+          fi
+
+          cat "${changed_files}"
+          echo "changed_files=${changed_files}" >> "$GITHUB_OUTPUT"
+
+      - name: Classify validation profile
+        id: classify
+        run: |
+          python3 ci/checks/classify_merge_profile.py \
+            --changed-files "${{ steps.changed-files.outputs.changed_files }}" \
+            --github-output "$GITHUB_OUTPUT"
+
+  release-policy-validation:
+    name: release-policy validation
+    needs: classify-changes
+    if: ${{ always() && needs.classify-changes.result == 'success' && needs.classify-changes.outputs.release_policy_only == 'true' }}
+    runs-on: tenki-standard-medium-4c-8g
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Write changed file list
+        id: changed-files
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref || github.event.merge_group.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+        run: |
+          set -euo pipefail
+
+          changed_files="${RUNNER_TEMP}/changed-files.txt"
+          diff_range=""
+          : > "${changed_files}"
+
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            if [[ -z "${BASE_SHA}" ]]; then
+              echo "::error::Pull request base SHA is unavailable."
+              exit 1
+            fi
+            diff_range="${BASE_SHA}...HEAD"
+            git diff --name-only "${diff_range}" > "${changed_files}"
+          elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
+            base_branch="${BASE_REF#refs/heads/}"
+            if [[ -z "${base_branch}" ]]; then
+              echo "::error::Merge-group base branch is unavailable."
+              exit 1
+            fi
+            git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
+            diff_range="origin/${base_branch}...HEAD"
+            git diff --name-only "${diff_range}" > "${changed_files}"
+          elif [[ "${EVENT_NAME}" == "push" ]]; then
+            if [[ -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
+              diff_range="${BEFORE_SHA}..HEAD"
+              git diff --name-only "${diff_range}" > "${changed_files}"
+            else
+              git fetch --no-tags --prune origin "${DEFAULT_BRANCH}"
+              merge_base="$(git merge-base "origin/${DEFAULT_BRANCH}" HEAD 2>/dev/null || true)"
+              if [[ -n "${merge_base}" ]]; then
+                diff_range="${merge_base}...HEAD"
+                git diff --name-only "${diff_range}" > "${changed_files}"
+              else
+                git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
+              fi
+            fi
+          else
+            git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
+          fi
+
+          cat "${changed_files}"
+          echo "changed_files=${changed_files}" >> "$GITHUB_OUTPUT"
+          echo "diff_range=${diff_range}" >> "$GITHUB_OUTPUT"
+
+      - name: Confirm release-policy-only profile
+        id: classify
+        run: |
+          python3 ci/checks/classify_merge_profile.py \
+            --changed-files "${{ steps.changed-files.outputs.changed_files }}" \
+            --github-output "$GITHUB_OUTPUT" \
+            --require-release-policy-only
+
+      - name: Check whitespace in changed files
+        env:
+          DIFF_RANGE: ${{ steps.changed-files.outputs.diff_range }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${DIFF_RANGE}" ]]; then
+            git diff --check "${DIFF_RANGE}"
+          else
+            git diff-tree --check --root HEAD
+          fi
+
+      - name: Check workflow YAML syntax
+        if: steps.classify.outputs.touched_release_publish == 'true'
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          try:
+              import yaml
+          except ModuleNotFoundError:
+              print("PyYAML is not installed; skipping best-effort YAML parse.")
+              raise SystemExit(0)
+
+          path = Path(".github/workflows/release-publish.yml")
+          yaml.safe_load(path.read_text(encoding="utf8"))
+          print(f"Parsed {path}")
+          PY
+
+      - name: Run release validator tests
+        if: steps.classify.outputs.touched_release_publish == 'true' || steps.classify.outputs.touched_release_validators == 'true'
+        run: |
+          set -euo pipefail
+
+          tests=(
+            ci.release.test_validate_builder_attestations
+            ci.release.test_validate_key_metadata
+            ci.release.test_validate_release_artifacts
+          )
+          if [[ -f ci/release/test_verify_testnet_release_posture.py ]]; then
+            tests+=(ci.release.test_verify_testnet_release_posture)
+          fi
+          python3 -m unittest "${tests[@]}"
+
+      - name: Validate operator key metadata
+        if: steps.classify.outputs.touched_operator_keys == 'true'
+        run: |
+          python3 ci/release/validate_key_metadata.py \
+            --operator-policy contrib/keys/operator-keys/keys.json \
+            --operator-keys-dir contrib/keys/operator-keys \
+            --require-public-key-files \
+            --skip-policy-transition-validation
+
+  rpc-docs-validation:
+    name: rpc-docs validation
+    needs: classify-changes
+    if: ${{ always() && needs.classify-changes.result == 'success' && needs.classify-changes.outputs.profile == 'rpc-docs' }}
+    runs-on: tenki-standard-medium-4c-8g
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Write changed file list
+        id: changed-files
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref || github.event.merge_group.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+        run: |
+          set -euo pipefail
+
+          changed_files="${RUNNER_TEMP}/changed-files.txt"
+          diff_range=""
+          : > "${changed_files}"
+
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            if [[ -z "${BASE_SHA}" ]]; then
+              echo "::error::Pull request base SHA is unavailable."
+              exit 1
+            fi
+            diff_range="${BASE_SHA}...HEAD"
+            git diff --name-only "${diff_range}" > "${changed_files}"
+          elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
+            base_branch="${BASE_REF#refs/heads/}"
+            if [[ -z "${base_branch}" ]]; then
+              echo "::error::Merge-group base branch is unavailable."
+              exit 1
+            fi
+            git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
+            diff_range="origin/${base_branch}...HEAD"
+            git diff --name-only "${diff_range}" > "${changed_files}"
+          elif [[ "${EVENT_NAME}" == "push" ]]; then
+            if [[ -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
+              diff_range="${BEFORE_SHA}..HEAD"
+              git diff --name-only "${diff_range}" > "${changed_files}"
+            else
+              git fetch --no-tags --prune origin "${DEFAULT_BRANCH}"
+              merge_base="$(git merge-base "origin/${DEFAULT_BRANCH}" HEAD 2>/dev/null || true)"
+              if [[ -n "${merge_base}" ]]; then
+                diff_range="${merge_base}...HEAD"
+                git diff --name-only "${diff_range}" > "${changed_files}"
+              else
+                git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
+              fi
+            fi
+          else
+            git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
+          fi
+
+          cat "${changed_files}"
+          echo "changed_files=${changed_files}" >> "$GITHUB_OUTPUT"
+          echo "diff_range=${diff_range}" >> "$GITHUB_OUTPUT"
+
+      - name: Confirm rpc-docs profile
+        run: |
+          python3 ci/checks/classify_merge_profile.py \
+            --changed-files "${{ steps.changed-files.outputs.changed_files }}" \
+            --require-profile rpc-docs
+
+      - name: Check whitespace in changed files
+        env:
+          DIFF_RANGE: ${{ steps.changed-files.outputs.diff_range }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${DIFF_RANGE}" ]]; then
+            git diff --check "${DIFF_RANGE}"
+          else
+            git diff-tree --check --root HEAD
+          fi
+
+      - name: Run RPC docs unit tests
+        run: python3 -m unittest discover -s test/rpc_docs
+
+  public-docs-validation:
+    name: public-docs validation
+    needs: classify-changes
+    if: ${{ always() && needs.classify-changes.result == 'success' && needs.classify-changes.outputs.profile == 'public-docs' }}
+    runs-on: tenki-standard-medium-4c-8g
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Write changed file list
+        id: changed-files
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref || github.event.merge_group.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+        run: |
+          set -euo pipefail
+
+          changed_files="${RUNNER_TEMP}/changed-files.txt"
+          diff_range=""
+          : > "${changed_files}"
+
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            if [[ -z "${BASE_SHA}" ]]; then
+              echo "::error::Pull request base SHA is unavailable."
+              exit 1
+            fi
+            diff_range="${BASE_SHA}...HEAD"
+            git diff --name-only "${diff_range}" > "${changed_files}"
+          elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
+            base_branch="${BASE_REF#refs/heads/}"
+            if [[ -z "${base_branch}" ]]; then
+              echo "::error::Merge-group base branch is unavailable."
+              exit 1
+            fi
+            git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
+            diff_range="origin/${base_branch}...HEAD"
+            git diff --name-only "${diff_range}" > "${changed_files}"
+          elif [[ "${EVENT_NAME}" == "push" ]]; then
+            if [[ -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
+              diff_range="${BEFORE_SHA}..HEAD"
+              git diff --name-only "${diff_range}" > "${changed_files}"
+            else
+              git fetch --no-tags --prune origin "${DEFAULT_BRANCH}"
+              merge_base="$(git merge-base "origin/${DEFAULT_BRANCH}" HEAD 2>/dev/null || true)"
+              if [[ -n "${merge_base}" ]]; then
+                diff_range="${merge_base}...HEAD"
+                git diff --name-only "${diff_range}" > "${changed_files}"
+              else
+                git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
+              fi
+            fi
+          else
+            git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
+          fi
+
+          cat "${changed_files}"
+          echo "changed_files=${changed_files}" >> "$GITHUB_OUTPUT"
+          echo "diff_range=${diff_range}" >> "$GITHUB_OUTPUT"
+
+      - name: Confirm public-docs profile
+        run: |
+          python3 ci/checks/classify_merge_profile.py \
+            --changed-files "${{ steps.changed-files.outputs.changed_files }}" \
+            --require-profile public-docs
+
+      - name: Check whitespace in changed files
+        env:
+          DIFF_RANGE: ${{ steps.changed-files.outputs.diff_range }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${DIFF_RANGE}" ]]; then
+            git diff --check "${DIFF_RANGE}"
+          else
+            git diff-tree --check --root HEAD
+          fi
+
+  github-metadata-validation:
+    name: github-metadata validation
+    needs: classify-changes
+    if: ${{ always() && needs.classify-changes.result == 'success' && needs.classify-changes.outputs.profile == 'github-metadata' }}
+    runs-on: tenki-standard-medium-4c-8g
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Write changed file list
+        id: changed-files
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref || github.event.merge_group.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch || 'main' }}
+        run: |
+          set -euo pipefail
+
+          changed_files="${RUNNER_TEMP}/changed-files.txt"
+          diff_range=""
+          : > "${changed_files}"
+
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            if [[ -z "${BASE_SHA}" ]]; then
+              echo "::error::Pull request base SHA is unavailable."
+              exit 1
+            fi
+            diff_range="${BASE_SHA}...HEAD"
+            git diff --name-only "${diff_range}" > "${changed_files}"
+          elif [[ "${EVENT_NAME}" == "merge_group" ]]; then
+            base_branch="${BASE_REF#refs/heads/}"
+            if [[ -z "${base_branch}" ]]; then
+              echo "::error::Merge-group base branch is unavailable."
+              exit 1
+            fi
+            git fetch --no-tags --prune origin "+refs/heads/${base_branch}:refs/remotes/origin/${base_branch}"
+            diff_range="origin/${base_branch}...HEAD"
+            git diff --name-only "${diff_range}" > "${changed_files}"
+          elif [[ "${EVENT_NAME}" == "push" ]]; then
+            if [[ -n "${BEFORE_SHA}" && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
+              diff_range="${BEFORE_SHA}..HEAD"
+              git diff --name-only "${diff_range}" > "${changed_files}"
+            else
+              git fetch --no-tags --prune origin "${DEFAULT_BRANCH}"
+              merge_base="$(git merge-base "origin/${DEFAULT_BRANCH}" HEAD 2>/dev/null || true)"
+              if [[ -n "${merge_base}" ]]; then
+                diff_range="${merge_base}...HEAD"
+                git diff --name-only "${diff_range}" > "${changed_files}"
+              else
+                git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
+              fi
+            fi
+          else
+            git diff-tree --no-commit-id --name-only -r HEAD > "${changed_files}"
+          fi
+
+          cat "${changed_files}"
+          echo "changed_files=${changed_files}" >> "$GITHUB_OUTPUT"
+          echo "diff_range=${diff_range}" >> "$GITHUB_OUTPUT"
+
+      - name: Confirm github-metadata profile
+        run: |
+          python3 ci/checks/classify_merge_profile.py \
+            --changed-files "${{ steps.changed-files.outputs.changed_files }}" \
+            --require-profile github-metadata
+
+      - name: Check whitespace in changed files
+        env:
+          DIFF_RANGE: ${{ steps.changed-files.outputs.diff_range }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${DIFF_RANGE}" ]]; then
+            git diff --check "${DIFF_RANGE}"
+          else
+            git diff-tree --check --root HEAD
+          fi
+
+      - name: Validate JSON metadata
+        run: jq empty .github/rulesets/*.json .github/repository-settings/*.json
+
+      - name: Check branch ruleset aggregate gate
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          for path in (Path(".github/rulesets/main.json"), Path(".github/rulesets/0.1.x.json")):
+              data = json.loads(path.read_text(encoding="utf8"))
+              contexts = []
+              for rule in data.get("rules", []):
+                  if rule.get("type") == "required_status_checks":
+                      checks = rule.get("parameters", {}).get("required_status_checks", [])
+                      contexts = [check.get("context") for check in checks]
+                      break
+              if contexts != ["Required Merge Gate"]:
+                  raise SystemExit(
+                      f"{path}: required status checks must be exactly ['Required Merge Gate'], got {contexts!r}"
+                  )
+              print(f"{path}: Required Merge Gate")
+          PY
+
+      - name: Check issue template YAML syntax
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          try:
+              import yaml
+          except ModuleNotFoundError:
+              print("PyYAML is not installed; skipping best-effort YAML parse.")
+              raise SystemExit(0)
+
+          for path in sorted(Path(".github/ISSUE_TEMPLATE").glob("*.yml")):
+              yaml.safe_load(path.read_text(encoding="utf8"))
+              print(f"Parsed {path}")
+          PY
+
+  required-merge-gate:
+    name: 'Required Merge Gate'
+    needs:
+      - classify-changes
+      - release-policy-validation
+      - rpc-docs-validation
+      - public-docs-validation
+      - github-metadata-validation
+    if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
+    runs-on: tenki-standard-medium-4c-8g
+    timeout-minutes: 360
+    steps:
+      - name: Check required validation profile
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CLASSIFY_CHANGES_RESULT: ${{ needs.classify-changes.result }}
+          VALIDATION_PROFILE: ${{ needs.classify-changes.outputs.profile }}
+          RELEASE_POLICY_VALIDATION_RESULT: ${{ needs.release-policy-validation.result }}
+          RPC_DOCS_VALIDATION_RESULT: ${{ needs.rpc-docs-validation.result }}
+          PUBLIC_DOCS_VALIDATION_RESULT: ${{ needs.public-docs-validation.result }}
+          GITHUB_METADATA_VALIDATION_RESULT: ${{ needs.github-metadata-validation.result }}
+          SOURCE_VALIDATION_REQUIRED: ${{ needs.classify-changes.outputs.source_validation_required }}
+          REPOSITORY: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${CLASSIFY_CHANGES_RESULT}" != "success" ]]; then
+            echo "::error title=Required Merge Gate failed::Change classification result was ${CLASSIFY_CHANGES_RESULT}."
+            exit 1
+          fi
+
+          wait_for_checks() {
+            local check_names=("$@")
+            local attempts=0
+            local max_attempts=720
+            local sleep_seconds=30
+            local pending_count
+            local check_name
+            local result
+            local status
+            local conclusion
+
+            while (( attempts < max_attempts )); do
+              pending_count=0
+
+              for check_name in "${check_names[@]}"; do
+                result="$(
+                  gh api \
+                    -H "Accept: application/vnd.github+json" \
+                    "/repos/${REPOSITORY}/commits/${SHA}/check-runs?per_page=100" \
+                    --jq ".check_runs | map(select(.name == \"${check_name}\")) | sort_by(.started_at // .created_at // \"\") | last // empty | [.status, (.conclusion // \"\")] | @tsv"
+                )"
+
+                if [[ -z "${result}" ]]; then
+                  echo "${check_name}: not found yet"
+                  pending_count=$((pending_count + 1))
+                  continue
+                fi
+
+                IFS=$'\t' read -r status conclusion <<< "${result}"
+                echo "${check_name}: status=${status} conclusion=${conclusion:-pending}"
+                if [[ "${status}" == "completed" ]]; then
+                  if [[ "${conclusion}" != "success" ]]; then
+                    echo "::error title=Required Merge Gate failed::${check_name} concluded ${conclusion}."
+                    return 1
+                  fi
+                  continue
+                fi
+
+                pending_count=$((pending_count + 1))
+              done
+
+              if (( pending_count == 0 )); then
+                return 0
+              fi
+
+              attempts=$((attempts + 1))
+              sleep "${sleep_seconds}"
+            done
+
+            echo "::error title=Required Merge Gate timed out::Required checks did not complete in time: ${check_names[*]}"
+            return 1
+          }
+
+          case "${VALIDATION_PROFILE}" in
+            release-policy)
+              echo "Validation profile ${VALIDATION_PROFILE} requires release-policy validation."
+              if [[ "${RELEASE_POLICY_VALIDATION_RESULT}" != "success" ]]; then
+                echo "::error title=Required Merge Gate failed::Release-policy validation result was ${RELEASE_POLICY_VALIDATION_RESULT}."
+                exit 1
+              fi
+              exit 0
+              ;;
+            rpc-docs)
+              echo "Validation profile ${VALIDATION_PROFILE} requires RPC docs validation."
+              if [[ "${RPC_DOCS_VALIDATION_RESULT}" != "success" ]]; then
+                echo "::error title=Required Merge Gate failed::RPC docs validation result was ${RPC_DOCS_VALIDATION_RESULT}."
+                exit 1
+              fi
+              wait_for_checks "rpc-docs"
+              exit 0
+              ;;
+            public-docs)
+              echo "Validation profile ${VALIDATION_PROFILE} requires public docs validation."
+              if [[ "${PUBLIC_DOCS_VALIDATION_RESULT}" != "success" ]]; then
+                echo "::error title=Required Merge Gate failed::Public docs validation result was ${PUBLIC_DOCS_VALIDATION_RESULT}."
+                exit 1
+              fi
+              wait_for_checks "public-docs-lint"
+              exit 0
+              ;;
+            github-metadata)
+              echo "Validation profile ${VALIDATION_PROFILE} requires GitHub metadata validation."
+              if [[ "${GITHUB_METADATA_VALIDATION_RESULT}" != "success" ]]; then
+                echo "::error title=Required Merge Gate failed::GitHub metadata validation result was ${GITHUB_METADATA_VALIDATION_RESULT}."
+                exit 1
+              fi
+              exit 0
+              ;;
+            source)
+              if [[ "${SOURCE_VALIDATION_REQUIRED}" != "true" ]]; then
+                echo "::error title=Required Merge Gate failed::Source validation flag was ${SOURCE_VALIDATION_REQUIRED}."
+                exit 1
+              fi
+              echo "Validation profile ${VALIDATION_PROFILE} requires Core Checks Gate and Full Validation Gate."
+              wait_for_checks "Core Checks Gate" "Full Validation Gate"
+              ;;
+            *)
+              echo "::error title=Required Merge Gate failed::Unknown validation profile ${VALIDATION_PROFILE}."
+              exit 1
+              ;;
+          esac
