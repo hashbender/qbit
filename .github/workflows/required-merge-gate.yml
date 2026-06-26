@@ -43,7 +43,7 @@ defaults:
 jobs:
   classify-changes:
     name: classify validation profile
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     outputs:
       profile: ${{ steps.classify.outputs.profile }}
       release_policy_only: ${{ steps.classify.outputs.release_policy_only }}
@@ -115,7 +115,7 @@ jobs:
     name: release-policy validation
     needs: classify-changes
     if: ${{ always() && needs.classify-changes.result == 'success' && needs.classify-changes.outputs.release_policy_only == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -241,7 +241,7 @@ jobs:
     name: rpc-docs validation
     needs: classify-changes
     if: ${{ always() && needs.classify-changes.result == 'success' && needs.classify-changes.outputs.profile == 'rpc-docs' }}
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -327,7 +327,7 @@ jobs:
     name: public-docs validation
     needs: classify-changes
     if: ${{ always() && needs.classify-changes.result == 'success' && needs.classify-changes.outputs.profile == 'public-docs' }}
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -410,7 +410,7 @@ jobs:
     name: github-metadata validation
     needs: classify-changes
     if: ${{ always() && needs.classify-changes.result == 'success' && needs.classify-changes.outputs.profile == 'github-metadata' }}
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -538,7 +538,7 @@ jobs:
       - public-docs-validation
       - github-metadata-validation
     if: ${{ always() && (github.event_name != 'pull_request' || github.event.pull_request.draft != true) }}
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     timeout-minutes: 360
     steps:
       - name: Check required validation profile
