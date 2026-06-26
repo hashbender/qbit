@@ -46,8 +46,8 @@ Ruleset JSON templates are the public-safe files below:
 
 | Template | Target | Baseline behavior |
 | --- | --- | --- |
-| `.github/rulesets/main.json` | `refs/heads/main` | Require pull requests, one approval, resolved conversations, squash/rebase merge methods only, linear history, `Core Checks Gate`, `Full Validation Gate`, block deletion, and block non-fast-forward updates. |
-| `.github/rulesets/0.1.x.json` | `refs/heads/0.1.x` | Restrict branch creation to bypass actors, require pull requests, one approval, resolved conversations, squash/rebase merge methods only, linear history, `Core Checks Gate`, `Full Validation Gate`, block deletion, and block non-fast-forward updates. |
+| `.github/rulesets/main.json` | `refs/heads/main` | Require pull requests, one approval, resolved conversations, squash/rebase merge methods only, linear history, `Required Merge Gate`, block deletion, and block non-fast-forward updates. |
+| `.github/rulesets/0.1.x.json` | `refs/heads/0.1.x` | Restrict branch creation to bypass actors, require pull requests, one approval, resolved conversations, squash/rebase merge methods only, linear history, `Required Merge Gate`, block deletion, and block non-fast-forward updates. |
 | `.github/rulesets/release-tags-v.json` | `refs/tags/v*` | Restrict tag creation, updates, and deletion to bypass actors. |
 | `.github/rulesets/upstream-refs.json` | `refs/heads/upstream/**` | Lock optional upstream reference branches so only bypass actors can create, update, or delete them. |
 
@@ -110,10 +110,74 @@ gh api \
 
 ## Operational Notes
 
-Required status checks are encoded only as the aggregate `Core Checks Gate` and
-`Full Validation Gate`. Do not protect public branches with raw job names,
-because raw jobs are internal inputs to the gates and some are skipped until a
-fork pull request is trusted by a maintainer.
+Required status checks are encoded only as the aggregate `Required Merge Gate`.
+Do not protect public branches with the raw `Core Checks Gate` or
+`Full Validation Gate` checks. Those checks are inputs to the required gate, and
+the required gate chooses the correct validation profile after classifying the
+changed paths. This keeps the required check present for every pull request
+without relying on workflow-level `paths` or `paths-ignore` filters, which can
+leave required workflows pending when GitHub skips them.
+
+The required merge gate has five validation profiles:
+
+| Profile | Applies to | Required validation |
+| --- | --- | --- |
+| Full source validation | Any source-affecting, mixed, unknown, or empty change set. | Require both `Core Checks Gate` and `Full Validation Gate` to complete successfully. |
+| Release-policy validation | Pull requests whose changed paths are only release policy or trusted release reference files. | Run `git diff --check`, release validator tests for touched release validator/workflow files, operator key metadata validation when operator keys are touched, and a best-effort local YAML parse for `release-publish.yml` when PyYAML is available. |
+| RPC docs validation | Pull requests whose changed paths are only RPC documentation pipeline files. | Run `git diff --check`, RPC docs unit tests, and require the existing `rpc-docs` build check. |
+| Public docs validation | Pull requests whose changed paths are only public-facing documentation and release notes. | Run `git diff --check` and require the existing `public-docs-lint` check. |
+| GitHub metadata validation | Pull requests whose changed paths are only public ruleset templates, repository settings, issue/PR templates, and the docs that explain those settings. | Run `git diff --check`, parse ruleset and repository-settings JSON, assert that public branch rulesets require only `Required Merge Gate`, and best-effort parse issue template YAML when PyYAML is available. |
+
+The lightweight profiles are intentionally narrow. The release-policy allowlist
+is:
+
+- `.github/workflows/release-publish.yml`
+- `ci/release/**`
+- `contrib/keys/operator-keys/**`
+- `doc/release-trust-*.md`
+
+The RPC docs allowlist is:
+
+- `doc/rpc/**`
+- `test/rpc_docs/**`
+- `cmake/script/normalize_rpc_docs_site_paths.py`
+
+The public docs allowlist is:
+
+- `README.md`
+- `CONTRIBUTING.md`
+- `SECURITY.md`
+- `doc/README.md`
+- `doc/deployment/**`
+- `doc/design/**`
+- `doc/integration/**`
+- `doc/performance/**`
+- `doc/policy/**`
+- `doc/reference/**`
+- `doc/user/**`
+- `doc/release-notes-*.md`
+
+The GitHub metadata allowlist is:
+
+- `.github/ISSUE_TEMPLATE/**`
+- `.github/PULL_REQUEST_TEMPLATE.md`
+- `.github/repository-settings/**`
+- `.github/rulesets/**`
+- `ci/README.md`
+- `doc/development/public-branch-and-rulesets.md`
+
+Trusted-release-ref and release-trust pull requests that stay within the
+release-policy allowlist can merge after release-policy validation and review
+without waiting for full source CI. RPC docs pull requests that stay within the
+RPC docs allowlist can merge after RPC docs validation and review without
+waiting for full source CI. Public documentation pull requests that stay within
+the public docs allowlist can merge after public docs validation and review
+without waiting for full source CI. GitHub metadata pull requests that stay
+within the metadata allowlist can merge after metadata validation and review
+without waiting for full source CI. Any path outside the active profile
+allowlist, including source, build, workflow, action, or test files, is
+classified as full source validation. Mixed changes, including changes that
+span more than one lightweight profile, also use full source validation.
 
 Merge queue is not enabled in these templates. Enable it only after public CI
 supports `merge_group` events.
@@ -135,4 +199,3 @@ Backports to `0.1.x` should be maintainer-directed and should state:
 
 If the `0.1.x` branch has not been created yet, create it from the final
 `v0.1.0-testnet4` tag target before opening the first backport pull request.
-
