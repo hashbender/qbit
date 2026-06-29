@@ -39,7 +39,9 @@ jobs:
     outputs:
       profile: ${{ steps.classify.outputs.profile }}
       release_policy_only: ${{ steps.classify.outputs.release_policy_only }}
-      source_validation_required: ${{ steps.classify.outputs.source_validation_required }}
+      # On forks, force source validation off (heavy jobs need Qbit-Org-only
+      # CI infra unreachable from fork tenki runners). Canonical repo unchanged.
+      source_validation_required: ${{ github.repository == 'Qbit-Org/qbit' && steps.classify.outputs.source_validation_required || 'false' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
