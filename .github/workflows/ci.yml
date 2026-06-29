@@ -286,7 +286,8 @@ jobs:
     name: ${{ matrix.job-name }}
     runs-on: tenki-standard-medium-4c-8g
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) }}
+    # Canonical repo only: tenki fork Windows runners lack a provisioned vcpkg.
+    if: ${{ github.repository == 'Qbit-Org/qbit' && needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) }}
     timeout-minutes: 240
 
     env:
@@ -621,7 +622,7 @@ jobs:
     # third-party Windows runner for untrusted fork PRs. success() preserves the
     # existing requirement that windows-cross completed; windows-cross shares
     # this trust gate, so untrusted forks skip it and this job in turn.
-    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && success() && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) }}
+    if: ${{ github.repository == 'Qbit-Org/qbit' && needs.classify-changes.outputs.source_validation_required == 'true' && success() && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) }}
     timeout-minutes: 240
 
     env:
@@ -783,7 +784,9 @@ jobs:
         if: ${{ env.CONTAINER_NAME == 'ci_native_asan' }}
         # In the image build step, no external environment variables are available,
         # so any settings will need to be written to the settings env file:
-        run: sed -i "s|\${INSTALL_BCC_TRACING_TOOLS}|true|g" ./ci/test/00_setup_env_native_asan.sh
+        # BCC tracing tools install linux-headers-$(uname -r); the fork's tenki
+        # kernel has no matching apt package, so only enable on the canonical repo.
+        run: sed -i "s|\${INSTALL_BCC_TRACING_TOOLS}|${{ github.repository == 'Qbit-Org/qbit' && 'true' || 'false' }}|g" ./ci/test/00_setup_env_native_asan.sh
 
       - name: Set mmap_rnd_bits
         if: ${{ env.CONTAINER_NAME == 'ci_native_tsan' || env.CONTAINER_NAME == 'ci_native_msan' }}
@@ -806,9 +809,13 @@ jobs:
           exit 1
 
       - name: CI script
+        # On forks, skip the i686 entry: tenki runners cannot execute 32-bit
+        # binaries (no 32-bit loader), so its test stage always fails.
+        if: ${{ !(github.repository != 'Qbit-Org/qbit' && matrix.file-env == './ci/test/00_setup_env_i686_no_ipc.sh') }}
         run: ./ci/test_run_all.sh
 
       - name: Save caches
+        if: ${{ !(github.repository != 'Qbit-Org/qbit' && matrix.file-env == './ci/test/00_setup_env_i686_no_ipc.sh') }}
         uses: ./.github/actions/save-caches
 
   lint:
@@ -1004,7 +1011,7 @@ jobs:
             local result="$2"
 
             echo "${name}: ${result}"
-            if [[ "${result}" != "success" ]]; then
+            if [[ "${result}" != "success" && "${result}" != "skipped" ]]; then
               echo "::error title=Full Validation failed::${name} result was ${result}."
               failed=1
             fi

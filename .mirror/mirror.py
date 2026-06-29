@@ -17,7 +17,14 @@ Idempotent: a "Mirror-of: Qbit-Org/qbit#N" marker in each mirrored PR body lets
 re-runs skip already-mirrored PRs and sync state transitions. Re-running on a
 schedule IS the ongoing watcher.
 """
-import argparse, glob, json, os, re, subprocess, sys, time
+import argparse
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
 
 UPSTREAM = "Qbit-Org/qbit"
 FORK     = "hashbender/qbit"
@@ -65,10 +72,10 @@ def tenkify_workflows():
     wf = os.path.join(REPO_DIR, ".github", "workflows")
     changed = []
     for p in glob.glob(wf + "/*.yml") + glob.glob(wf + "/*.yaml"):
-        old = open(p).read()
+        old = open(p, encoding="utf8").read()
         new = tenkify(old)
         if new != old:
-            open(p, "w").write(new)
+            open(p, "w", encoding="utf8").write(new)
             changed.append(os.path.relpath(p, REPO_DIR))
     return changed
 
@@ -199,7 +206,7 @@ def main():
     git("fetch", "--quiet", FORKREM, "+refs/heads/*:refs/remotes/fork/*")
 
     if args.prs_file:
-        prs = json.load(open(args.prs_file))
+        prs = json.load(open(args.prs_file, encoding="utf8"))
     else:
         prs = json.loads(gh("pr", "list", "--repo", UPSTREAM, "--state", "all",
               "--limit", "100", "--json",
