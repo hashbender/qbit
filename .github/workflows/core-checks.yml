@@ -35,7 +35,7 @@ defaults:
 jobs:
   classify-changes:
     name: classify validation profile
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     outputs:
       profile: ${{ steps.classify.outputs.profile }}
       release_policy_only: ${{ steps.classify.outputs.release_policy_only }}
@@ -104,7 +104,7 @@ jobs:
     name: build smoke
     needs: classify-changes
     if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     timeout-minutes: 45
 
     steps:
@@ -151,7 +151,7 @@ jobs:
     name: focused unit suites
     needs: classify-changes
     if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     timeout-minutes: 75
 
     steps:
@@ -208,8 +208,8 @@ jobs:
   functional-smoke:
     name: functional smoke
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' }}
-    runs-on: ubuntu-24.04
+    if: ${{ github.repository == 'Qbit-Org/qbit' && needs.classify-changes.outputs.source_validation_required == 'true' }}
+    runs-on: tenki-standard-medium-4c-8g
     timeout-minutes: 90
 
     steps:
@@ -268,7 +268,7 @@ jobs:
     name: release validator tests
     needs: classify-changes
     if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' }}
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     timeout-minutes: 20
 
     steps:
@@ -370,7 +370,7 @@ jobs:
 
   core-checks-gate:
     name: 'Core Checks Gate'
-    runs-on: ubuntu-24.04
+    runs-on: tenki-standard-medium-4c-8g
     needs:
       - classify-changes
       - build-smoke
@@ -400,7 +400,7 @@ jobs:
             local result="$2"
 
             echo "${name}: ${result}"
-            if [[ "${result}" != "success" ]]; then
+            if [[ "${result}" != "success" && "${result}" != "skipped" ]]; then
               echo "::error title=Core Checks failed::${name} result was ${result}."
               failed=1
             fi
