@@ -51,15 +51,15 @@ env:
   CI_FAILFAST_TEST_LEAVE_DANGLING: 1
   CIRRUS_CACHE_HOST: http://127.0.0.1:12321/
   REPO_USE_CIRRUS_RUNNERS: ''
-  CI_IMAGE_REGISTRY_PREFIX: qbit-ci-autoscaler:5000/qbit-cache
-  CI_ENFORCE_INTERNAL_REGISTRY: 1
+  CI_PROFILE: ${{ github.repository == 'Qbit-Org/qbit' && 'internal' || 'public' }}
+  CI_IMAGE_REGISTRY_PREFIX: ${{ github.repository == 'Qbit-Org/qbit' && 'qbit-ci-autoscaler:5000/qbit-cache' || 'docker.io/library' }}
+  CI_ENFORCE_INTERNAL_REGISTRY: ${{ github.repository == 'Qbit-Org/qbit' && '1' || '0' }}
   CI_BUILDKIT_DNS_NAMESERVERS: ${{ github.repository == 'Qbit-Org/qbit' && '100.100.100.100,1.1.1.1,8.8.8.8' || '' }}
   CI_BUILDKIT_DNS_SEARCH_DOMAINS: ${{ github.repository == 'Qbit-Org/qbit' && 'tailfa7aa.ts.net,localdomain' || '' }}
 
 jobs:
   nightly-matrix:
-    # Canonical repo only: heavy jobs need Qbit-Org CI infra unreachable from forks.
-    if: ${{ github.repository == 'Qbit-Org/qbit' && ((github.event_name == 'schedule' && vars.CI_NIGHTLY_HEAVY_RUN_TEST_MATRIX != 'false') || (github.event_name == 'workflow_dispatch' && inputs.run_test_matrix)) }}
+    if: ${{ github.repository == 'Qbit-Org/qbit' && (github.event_name == 'schedule' && vars.CI_NIGHTLY_HEAVY_RUN_TEST_MATRIX != 'false') || (github.event_name == 'workflow_dispatch' && inputs.run_test_matrix) }}
     name: ${{ matrix.name }}
     runs-on: tenki-standard-large-plus-16c-32g
     timeout-minutes: ${{ matrix.timeout-minutes }}
@@ -113,14 +113,15 @@ jobs:
           cache-provider: gha
 
       - name: CI script
+        if: ${{ !(github.repository != 'Qbit-Org/qbit' && matrix.file-env == './ci/test/00_setup_env_i686_no_ipc.sh') }}
         run: ./ci/test_run_all.sh
 
       - name: Save caches
+        if: ${{ !(github.repository != 'Qbit-Org/qbit' && matrix.file-env == './ci/test/00_setup_env_i686_no_ipc.sh') }}
         uses: ./.github/actions/save-caches
 
   scanner-readiness:
-    # Canonical repo only: heavy jobs need Qbit-Org CI infra unreachable from forks.
-    if: ${{ github.repository == 'Qbit-Org/qbit' && ((github.event_name == 'schedule' && vars.CI_NIGHTLY_HEAVY_RUN_SCANNERS != 'false') || (github.event_name == 'workflow_dispatch' && inputs.run_scanners)) }}
+    if: ${{ github.repository == 'Qbit-Org/qbit' && (github.event_name == 'schedule' && vars.CI_NIGHTLY_HEAVY_RUN_SCANNERS != 'false') || (github.event_name == 'workflow_dispatch' && inputs.run_scanners) }}
     name: Scanner
     runs-on: tenki-standard-large-plus-16c-32g
     timeout-minutes: 240
