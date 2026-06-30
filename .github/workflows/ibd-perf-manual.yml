@@ -108,6 +108,7 @@ permissions:
 jobs:
   ibd-perf:
     name: IBD perf
+    if: ${{ github.repository == 'Qbit-Org/qbit' }}
     runs-on: tenki-standard-large-plus-16c-32g
     timeout-minutes: 720
     env:

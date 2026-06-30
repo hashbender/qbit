@@ -39,8 +39,8 @@ env:
   CI_FAILFAST_TEST_LEAVE_DANGLING: 1  # GHA does not care about dangling processes and setting this variable avoids killing the CI script itself on error
   CIRRUS_CACHE_HOST: http://127.0.0.1:12321/ # When using Cirrus Runners this host can be used by the docker `gha` build cache type.
   REPO_USE_CIRRUS_RUNNERS: '' # Disabled: using self-hosted runners
-  CI_IMAGE_REGISTRY_PREFIX: qbit-ci-autoscaler:5000/qbit-cache
-  CI_ENFORCE_INTERNAL_REGISTRY: 1
+  CI_IMAGE_REGISTRY_PREFIX: ${{ github.repository == 'Qbit-Org/qbit' && 'qbit-ci-autoscaler:5000/qbit-cache' || 'docker.io/library' }}
+  CI_ENFORCE_INTERNAL_REGISTRY: ${{ github.repository == 'Qbit-Org/qbit' && '1' || '0' }}
   CI_BUILDKIT_DNS_NAMESERVERS: ${{ github.repository == 'Qbit-Org/qbit' && '100.100.100.100,1.1.1.1,8.8.8.8' || '' }}
   CI_BUILDKIT_DNS_SEARCH_DOMAINS: ${{ github.repository == 'Qbit-Org/qbit' && 'tailfa7aa.ts.net,localdomain' || '' }}
 
@@ -266,6 +266,7 @@ jobs:
           restore-keys: ${{ github.job }}-${{ matrix.job-type }}-ccache-
 
       - name: CI script
+        if: ${{ !(github.repository != 'Qbit-Org/qbit' && matrix.file-env == './ci/test/00_setup_env_i686_no_ipc.sh') }}
         run: ./ci/test_run_all.sh
         env:
           FILE_ENV: ${{ matrix.file-env }}
@@ -282,7 +283,7 @@ jobs:
     name: ${{ matrix.job-name }}
     runs-on: tenki-standard-medium-4c-8g
     needs: classify-changes
-    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) }}
+    if: ${{ github.repository == 'Qbit-Org/qbit' && needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) }}
     timeout-minutes: 240
 
     env:
@@ -592,9 +593,11 @@ jobs:
           cache-provider: ${{ needs.runners.outputs.provider }}
 
       - name: CI script
+        if: ${{ !(github.repository != 'Qbit-Org/qbit' && matrix.file-env == './ci/test/00_setup_env_i686_no_ipc.sh') }}
         run: ./ci/test_run_all.sh
 
       - name: Save caches
+        if: ${{ !(github.repository != 'Qbit-Org/qbit' && matrix.file-env == './ci/test/00_setup_env_i686_no_ipc.sh') }}
         uses: ./.github/actions/save-caches
 
       - name: Upload built executables
@@ -617,7 +620,7 @@ jobs:
     # third-party Windows runner for untrusted fork PRs. success() preserves the
     # existing requirement that windows-cross completed; windows-cross shares
     # this trust gate, so untrusted forks skip it and this job in turn.
-    if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && success() && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) }}
+    if: ${{ github.repository == 'Qbit-Org/qbit' && needs.classify-changes.outputs.source_validation_required == 'true' && success() && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) }}
     timeout-minutes: 240
 
     env:
@@ -703,7 +706,7 @@ jobs:
       CTEST_JOBS: ${{ matrix.ctest-jobs || '6' }}
       CI_DOCKER_RUN_CPUS: ${{ matrix.container-cpus || '8' }}
       CI_DOCKER_RUN_MEMORY: ${{ matrix.container-memory || '48g' }}
-      CI_ENFORCE_INTERNAL_REGISTRY: ${{ matrix.file-env == './ci/test/00_setup_env_native_centos.sh' && '0' || '1' }}
+      CI_ENFORCE_INTERNAL_REGISTRY: ${{ (github.repository == 'Qbit-Org/qbit' && matrix.file-env != './ci/test/00_setup_env_native_centos.sh') && '1' || '0' }}
 
     strategy:
       fail-fast: false
@@ -776,7 +779,7 @@ jobs:
         if: ${{ env.CONTAINER_NAME == 'ci_native_asan' }}
         # In the image build step, no external environment variables are available,
         # so any settings will need to be written to the settings env file:
-        run: sed -i "s|\${INSTALL_BCC_TRACING_TOOLS}|true|g" ./ci/test/00_setup_env_native_asan.sh
+        run: sed -i "s|\${INSTALL_BCC_TRACING_TOOLS}|${{ github.repository == 'Qbit-Org/qbit' && 'true' || 'false' }}|g" ./ci/test/00_setup_env_native_asan.sh
 
       - name: Set mmap_rnd_bits
         if: ${{ env.CONTAINER_NAME == 'ci_native_tsan' || env.CONTAINER_NAME == 'ci_native_msan' }}
@@ -799,9 +802,11 @@ jobs:
           exit 1
 
       - name: CI script
+        if: ${{ !(github.repository != 'Qbit-Org/qbit' && matrix.file-env == './ci/test/00_setup_env_i686_no_ipc.sh') }}
         run: ./ci/test_run_all.sh
 
       - name: Save caches
+        if: ${{ !(github.repository != 'Qbit-Org/qbit' && matrix.file-env == './ci/test/00_setup_env_i686_no_ipc.sh') }}
         uses: ./.github/actions/save-caches
 
   lint:
@@ -997,7 +1002,7 @@ jobs:
             local result="$2"
 
             echo "${name}: ${result}"
-            if [[ "${result}" != "success" ]]; then
+            if [[ "${result}" != "success" && "${result}" != "skipped" ]]; then
               echo "::error title=Full Validation failed::${name} result was ${result}."
               failed=1
             fi
