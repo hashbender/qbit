@@ -107,11 +107,15 @@ _GATE_WITH_IF = ("windows-native-dll", "functional-smoke", "nightly-matrix",
 _GATE_ADD_IF  = ("ibd-perf", "rpc-perf")
 
 def _gate_with_if(text, key):
-    pat = re.compile(r"(\n  " + re.escape(key) + r":\n(?:    [^\n]*\n)*?    if: \$\{\{ )")
+    # Idempotent: the negative lookahead skips an `if:` already gated by _RG, so
+    # repeated tenkify passes (base reconstruct + PR overlays) don't compound it.
+    pat = re.compile(r"(\n  " + re.escape(key) + r":\n(?:    [^\n]*\n)*?    if: \$\{\{ )(?!" + re.escape(_RG) + ")")
     return pat.sub(r"\1" + _RG + " && ", text, count=1)
 
 def _gate_add_if(text, key):
-    pat = re.compile(r"(\n  " + re.escape(key) + r":\n    name: [^\n]*\n)")
+    # Idempotent: the negative lookahead skips a job that already has an `if:`
+    # after `name:`, so repeated passes don't insert duplicate `if:` keys.
+    pat = re.compile(r"(\n  " + re.escape(key) + r":\n    name: [^\n]*\n)(?!    if:)")
     return pat.sub(r"\1    if: ${{ " + _RG + " }}\n", text, count=1)
 
 def decouple(text):
