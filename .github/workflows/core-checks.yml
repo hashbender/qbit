@@ -210,7 +210,7 @@ jobs:
     needs: classify-changes
     # Canonical repo only: the fork's tenki runners can't serve RPC on IPv6 ::1,
     # which interface_bitcoin_cli.py requires.
-    if: ${{ github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && needs.classify-changes.outputs.source_validation_required == 'true' }}
+    if: ${{ github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && needs.classify-changes.outputs.source_validation_required == 'true' }}
     runs-on: tenki-standard-medium-4c-8g
     timeout-minutes: 90
 
