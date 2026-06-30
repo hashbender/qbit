@@ -34,7 +34,7 @@ env:
 jobs:
   prewarm:
     name: Prewarm lint image cache
-    if: ${{ github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && github.ref_name == github.event.repository.default_branch }}
+    if: ${{ github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && github.ref_name == github.event.repository.default_branch }}
     runs-on: tenki-standard-large-plus-16c-32g
     timeout-minutes: 45
     steps:
