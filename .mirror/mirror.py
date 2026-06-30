@@ -62,10 +62,78 @@ _EXPR   = re.compile(r"\$\{\{[^}]*github\.repository[^}]*self-hosted[^}]*\}\}")
 _ARR    = re.compile(r"(runs-on:\s*)\[\s*self-hosted[^\]]*\]")
 _HOSTED = re.compile(r"(runs-on:\s*)(?:ubuntu|macos|windows|blacksmith)-[\w.\-]+")
 
+# --- decouple from Qbit-Org-only CI infra -----------------------------------
+# Fork tenki runners can't reach Qbit-Org's internal registry / tailnet DNS, and
+# lack some capabilities (IPv6 ::1 RPC, a 32-bit loader, a provisioned Windows
+# vcpkg, matching kernel headers). Apply the same fork accommodations the
+# canonical workflows carry on the fork's main, so every base the mirror
+# reconstructs is green on the fork's tenki runners. github.repository keeps
+# canonical behavior intact if these ever ran on Qbit-Org/qbit.
+_RG = "github.repository == 'Qbit-Org/qbit'"
+_I686 = "matrix.file-env == './ci/test/00_setup_env_i686_no_ipc.sh'"
+
+# (find, replace) exact substitutions; the registry ones are asserted below.
+_DECOUPLE_SUBS = [
+    ("CI_IMAGE_REGISTRY_PREFIX: qbit-ci-autoscaler:5000/qbit-cache",
+     "CI_IMAGE_REGISTRY_PREFIX: ${{ " + _RG + " && 'qbit-ci-autoscaler:5000/qbit-cache' || 'docker.io/library' }}"),
+    ("CI_ENFORCE_INTERNAL_REGISTRY: 1",
+     "CI_ENFORCE_INTERNAL_REGISTRY: ${{ " + _RG + " && '1' || '0' }}"),
+    ("CI_ENFORCE_INTERNAL_REGISTRY: ${{ matrix.file-env == './ci/test/00_setup_env_native_centos.sh' && '0' || '1' }}",
+     "CI_ENFORCE_INTERNAL_REGISTRY: ${{ (" + _RG + " && matrix.file-env != './ci/test/00_setup_env_native_centos.sh') && '1' || '0' }}"),
+    # BCC tracing tools install linux-headers-$(uname -r), absent on tenki kernels
+    ('|true|g" ./ci/test/00_setup_env_native_asan.sh',
+     "|${{ " + _RG + " && 'true' || 'false' }}|g\" ./ci/test/00_setup_env_native_asan.sh"),
+    # gates: treat a skipped capability-gap job as a pass (both gate files)
+    ('if [[ "${result}" != "success" ]]; then',
+     'if [[ "${result}" != "success" && "${result}" != "skipped" ]]; then'),
+    # windows-native-test: no vcpkg/runtime on fork; success() makes this unique
+    ("if: ${{ needs.classify-changes.outputs.source_validation_required == 'true' && success()",
+     "if: ${{ " + _RG + " && needs.classify-changes.outputs.source_validation_required == 'true' && success()"),
+    # i686 matrix entry: no 32-bit loader on tenki. Guard is a no-op on every
+    # other entry (different matrix.file-env), so it can be applied to all.
+    ("      - name: CI script\n        run: ./ci/test_run_all.sh",
+     "      - name: CI script\n        if: ${{ !(github.repository != 'Qbit-Org/qbit' && " + _I686 + ") }}\n        run: ./ci/test_run_all.sh"),
+    ("      - name: Save caches\n        uses: ./.github/actions/save-caches",
+     "      - name: Save caches\n        if: ${{ !(github.repository != 'Qbit-Org/qbit' && " + _I686 + ") }}\n        uses: ./.github/actions/save-caches"),
+]
+
+# Jobs gated to the canonical repo (skip on forks): with an existing `if:` get
+# the gate prepended; the perf jobs (no `if:`) get one added after `name:`.
+_GATE_WITH_IF = ("windows-native-dll", "functional-smoke", "nightly-matrix",
+                 "scanner-readiness", "prewarm")
+_GATE_ADD_IF  = ("ibd-perf", "rpc-perf")
+
+def _gate_with_if(text, key):
+    pat = re.compile(r"(\n  " + re.escape(key) + r":\n(?:    [^\n]*\n)*?    if: \$\{\{ )")
+    return pat.sub(r"\1" + _RG + " && ", text, count=1)
+
+def _gate_add_if(text, key):
+    pat = re.compile(r"(\n  " + re.escape(key) + r":\n    name: [^\n]*\n)")
+    return pat.sub(r"\1    if: ${{ " + _RG + " }}\n", text, count=1)
+
+def decouple(text):
+    for find, repl in _DECOUPLE_SUBS:
+        text = text.replace(find, repl)
+    for key in _GATE_WITH_IF:
+        text = _gate_with_if(text, key)
+    for key in _GATE_ADD_IF:
+        text = _gate_add_if(text, key)
+    return text
+
+def assert_decoupled(text, path):
+    bad = []
+    if "CI_ENFORCE_INTERNAL_REGISTRY: 1\n" in text:
+        bad.append("internal-registry enforcement still hard-on")
+    if "CI_IMAGE_REGISTRY_PREFIX: qbit-ci-autoscaler:5000/qbit-cache\n" in text:
+        bad.append("internal registry prefix not rewritten")
+    if bad:
+        sys.exit("{}: decouple incomplete (upstream drift?): {}".format(path, "; ".join(bad)))
+
 def tenkify(text):
     text = _EXPR.sub(TENKI_LARGE, text)
     text = _ARR.sub(r"\1" + TENKI_LARGE, text)
     text = _HOSTED.sub(r"\1" + TENKI_MEDIUM, text)
+    text = decouple(text)
     return text
 
 def tenkify_workflows():
@@ -74,6 +142,7 @@ def tenkify_workflows():
     for p in glob.glob(wf + "/*.yml") + glob.glob(wf + "/*.yaml"):
         old = open(p, encoding="utf8").read()
         new = tenkify(old)
+        assert_decoupled(new, p)
         if new != old:
             open(p, "w", encoding="utf8").write(new)
             changed.append(os.path.relpath(p, REPO_DIR))
