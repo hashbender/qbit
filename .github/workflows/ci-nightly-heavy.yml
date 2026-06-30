@@ -58,7 +58,7 @@ env:
 
 jobs:
   nightly-matrix:
-    if: ${{ github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && (github.event_name == 'schedule' && vars.CI_NIGHTLY_HEAVY_RUN_TEST_MATRIX != 'false') || (github.event_name == 'workflow_dispatch' && inputs.run_test_matrix) }}
+    if: ${{ github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && (github.event_name == 'schedule' && vars.CI_NIGHTLY_HEAVY_RUN_TEST_MATRIX != 'false') || (github.event_name == 'workflow_dispatch' && inputs.run_test_matrix) }}
     name: ${{ matrix.name }}
     runs-on: tenki-standard-large-plus-16c-32g
     timeout-minutes: ${{ matrix.timeout-minutes }}
@@ -120,7 +120,7 @@ jobs:
         uses: ./.github/actions/save-caches
 
   scanner-readiness:
-    if: ${{ github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && (github.event_name == 'schedule' && vars.CI_NIGHTLY_HEAVY_RUN_SCANNERS != 'false') || (github.event_name == 'workflow_dispatch' && inputs.run_scanners) }}
+    if: ${{ github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && (github.event_name == 'schedule' && vars.CI_NIGHTLY_HEAVY_RUN_SCANNERS != 'false') || (github.event_name == 'workflow_dispatch' && inputs.run_scanners) }}
     name: Scanner
     runs-on: tenki-standard-large-plus-16c-32g
     timeout-minutes: 240
