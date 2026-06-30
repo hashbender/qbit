@@ -61,6 +61,9 @@ def gh(*a, check=True):
 _EXPR   = re.compile(r"\$\{\{[^}]*github\.repository[^}]*self-hosted[^}]*\}\}")
 _ARR    = re.compile(r"(runs-on:\s*)\[\s*self-hosted[^\]]*\]")
 _HOSTED = re.compile(r"(runs-on:\s*)(?:ubuntu|macos|windows|blacksmith)-[\w.\-]+")
+# runs-on as a repo-conditional expression resolving to a hosted/blacksmith
+# label (no self-hosted), e.g. ${{ ... && 'blacksmith-...' || 'windows-2022' }}.
+_EXPR_HOSTED = re.compile(r"(runs-on:\s*)\$\{\{[^}]*(?:ubuntu|macos|windows|blacksmith)-[^}]*\}\}")
 
 # --- decouple from Qbit-Org-only CI infra -----------------------------------
 # Fork tenki runners can't reach Qbit-Org's internal registry / tailnet DNS, and
@@ -133,6 +136,7 @@ def tenkify(text):
     text = _EXPR.sub(TENKI_LARGE, text)
     text = _ARR.sub(r"\1" + TENKI_LARGE, text)
     text = _HOSTED.sub(r"\1" + TENKI_MEDIUM, text)
+    text = _EXPR_HOSTED.sub(r"\1" + TENKI_MEDIUM, text)
     text = decouple(text)
     return text
 
