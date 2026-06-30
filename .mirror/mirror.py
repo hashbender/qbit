@@ -249,6 +249,27 @@ def existing_mirrors():
             mp[k] = p
     return mp
 
+# --- base reconstruction ----------------------------------------------------
+
+def _reconstruct_base(b, first, all_prs, ex, verb, log):
+    # Rebuild one base branch from its pre-PR start point with tenki labels +
+    # infra decoupling, then optionally push it. Used both for the initial
+    # backfill and to auto-create a newly-appeared upstream base in continue
+    # mode (so a new base no longer forces a full --reset-bases).
+    start, mode = _pick_start(b, first, all_prs)
+    git("checkout", "--quiet", "--detach", start)
+    wf = tenkify_workflows()
+    assert_tenki("base " + b)
+    if wf:
+        git("add", "-A")
+        git("commit", "--quiet", "-m",
+            "ci: tenki runner labels for {} (mirror base)".format(b))
+    sha = git("rev-parse", "HEAD")
+    log("  {:<26} {} {} (+{} wf)  [{}]".format(b, verb, sha[:10], len(wf), mode))
+    if ex:
+        git("push", "--force", FORKREM, "{}:refs/heads/{}".format(sha, b))
+    return sha
+
 # --- main -------------------------------------------------------------------
 
 def main():
@@ -298,28 +319,19 @@ def main():
     evolving = {}   # base -> local commit sha that the next PR on it builds upon
     for b, first in bases.items():
         if args.reset_bases:
-            start, mode = _pick_start(b, first, all_prs)
-            git("checkout", "--quiet", "--detach", start)
-            wf = tenkify_workflows()
-            assert_tenki("base " + b)
-            if wf:
-                git("add", "-A")
-                git("commit", "--quiet", "-m",
-                    "ci: tenki runner labels for {} (mirror base)".format(b))
-            sha = git("rev-parse", "HEAD")
-            evolving[b] = sha
-            log("  {:<26} start {} (+{} wf)  [{}]".format(b, sha[:10], len(wf), mode))
-            if ex:
-                git("push", "--force", FORKREM, "{}:refs/heads/{}".format(sha, b))
-        else:
-            ref = "fork/" + b
-            sha = subprocess.run(["git", "-C", REPO_DIR, "rev-parse", "-q", "--verify", ref],
-                                 capture_output=True, text=True).stdout.strip()
-            if not sha:
-                sys.exit("base {} missing on fork; run the initial backfill with "
-                         "--reset-bases first".format(b))
+            evolving[b] = _reconstruct_base(b, first, all_prs, ex, "start", log)
+            continue
+        ref = "fork/" + b
+        sha = subprocess.run(["git", "-C", REPO_DIR, "rev-parse", "-q", "--verify", ref],
+                             capture_output=True, text=True).stdout.strip()
+        if sha:
             evolving[b] = sha
             log("  {:<26} continue {}".format(b, sha[:10]))
+        else:
+            # New upstream base not yet on the fork: reconstruct just this one
+            # (tenki + decoupled) instead of bailing for a full --reset-bases.
+            # Existing bases (main, 0.1.x, develop) are left untouched.
+            evolving[b] = _reconstruct_base(b, first, all_prs, ex, "create", log)
 
     # 2) replay PRs chronologically.
     log("\n== PRs ({}) ==".format(len(prs)))
