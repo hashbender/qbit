@@ -277,10 +277,15 @@ void WaitForDeleteWallet(std::shared_ptr<CWallet>&& wallet)
     }
 }
 
-bool IsAvailableWalletOutputType(const CWallet& wallet, OutputType type, bool internal)
+bool HasWalletOutputTypeManager(const CWallet& wallet, OutputType type, bool internal)
 {
     LOCK(wallet.cs_wallet);
-    return IsWalletOutputTypeAllowed(type) && wallet.GetScriptPubKeyMan(type, internal) != nullptr;
+    return wallet.GetScriptPubKeyMan(type, internal) != nullptr;
+}
+
+bool IsAvailableWalletOutputType(const CWallet& wallet, OutputType type, bool internal)
+{
+    return IsWalletOutputTypeAllowed(type) && HasWalletOutputTypeManager(wallet, type, internal);
 }
 
 namespace {
@@ -317,6 +322,20 @@ std::optional<bilingual_str> GetInactiveP2MRWalletOutputError(const CWallet& wal
     }
 
     return strprintf(_("P2MR wallet outputs are unavailable before activation height %d (current wallet height: %d)"), p2mr_height, wallet_height);
+}
+
+std::optional<bilingual_str> GetWalletOutputTypeInitError(
+    const CWallet& wallet, OutputType type, bool internal, const char* kind, const std::string& requested_type)
+{
+    if (!IsWalletOutputTypeAllowed(type)) {
+        return Untranslated(strprintf("%s '%s' is not available on this chain", kind, requested_type));
+    }
+
+    const bool has_active_managers{WITH_LOCK(wallet.cs_wallet, return !wallet.GetActiveScriptPubKeyMans().empty())};
+    if (has_active_managers && !HasWalletOutputTypeManager(wallet, type, internal)) {
+        return Untranslated(strprintf("%s '%s' is not available in this wallet", kind, requested_type));
+    }
+    return std::nullopt;
 }
 
 unsigned int GetCreateWalletWarmupKeypoolSize(OutputType output_type, int64_t keypool_size)
@@ -1477,10 +1496,15 @@ bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef& ptx, const SyncTxS
             // loop though all outputs
             for (const CTxOut& txout: tx.vout) {
                 for (const auto& spk_man : GetScriptPubKeyMans(txout.scriptPubKey)) {
-                    for (auto &dest : spk_man->MarkUnusedAddresses(txout.scriptPubKey)) {
+                    const std::optional<bool> internal{IsInternalScriptPubKeyMan(spk_man)};
+                    const MarkUnusedAddressesOptions mark_options{
+                        .internal_hint = internal,
+                        .preserve_full_keypool_lookahead = rescanning_old_block,
+                    };
+                    for (auto &dest : spk_man->MarkUnusedAddresses(txout.scriptPubKey, mark_options)) {
                         // If internal flag is not defined try to infer it from the ScriptPubKeyMan
                         if (!dest.internal.has_value()) {
-                            dest.internal = IsInternalScriptPubKeyMan(spk_man);
+                            dest.internal = internal;
                         }
 
                         // skip if can't determine whether it's a receiving address or not
@@ -3260,7 +3284,7 @@ CWallet::P2MRKeyPoolRefillStepResult CWallet::RunP2MRKeyPoolRefillStep(bool inte
         bool& scheduled{internal ? m_p2mr_change_keypool_refill_scheduled : m_p2mr_receive_keypool_refill_scheduled};
         if (IsLocked() || HasPendingInitialKeyPoolTopUp()) {
             scheduled = false;
-            return P2MRKeyPoolRefillStepResult::COMPLETE;
+            return P2MRKeyPoolRefillStepResult::FAILED;
         }
         desc_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(GetScriptPubKeyMan(OutputType::P2MR, internal));
         if (!desc_spk_man || desc_spk_man->P2MRReceiveKeyPoolFull()) {
@@ -4012,13 +4036,15 @@ std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::stri
     }
 
     if (!args.GetArg("-addresstype", "").empty()) {
-        std::optional<OutputType> parsed = ParseOutputType(args.GetArg("-addresstype", ""));
+        const std::string requested_type{args.GetArg("-addresstype", "")};
+        std::optional<OutputType> parsed = ParseOutputType(requested_type);
         if (!parsed) {
-            error = strprintf(_("Unknown address type '%s'"), args.GetArg("-addresstype", ""));
+            error = strprintf(_("Unknown address type '%s'"), requested_type);
             return nullptr;
         }
-        if (!IsAvailableWalletOutputType(*walletInstance, parsed.value(), /*internal=*/false)) {
-            error = Untranslated(strprintf("Address type '%s' is not available on this chain", args.GetArg("-addresstype", "")));
+        if (auto availability_error{GetWalletOutputTypeInitError(
+                *walletInstance, parsed.value(), /*internal=*/false, "Address type", requested_type)}) {
+            error = *availability_error;
             return nullptr;
         }
         walletInstance->m_default_address_type = parsed.value();
@@ -4027,13 +4053,15 @@ std::shared_ptr<CWallet> CWallet::Create(WalletContext& context, const std::stri
     }
 
     if (!args.GetArg("-changetype", "").empty()) {
-        std::optional<OutputType> parsed = ParseOutputType(args.GetArg("-changetype", ""));
+        const std::string requested_type{args.GetArg("-changetype", "")};
+        std::optional<OutputType> parsed = ParseOutputType(requested_type);
         if (!parsed) {
-            error = strprintf(_("Unknown change type '%s'"), args.GetArg("-changetype", ""));
+            error = strprintf(_("Unknown change type '%s'"), requested_type);
             return nullptr;
         }
-        if (!IsAvailableWalletOutputType(*walletInstance, parsed.value(), /*internal=*/true)) {
-            error = Untranslated(strprintf("Change type '%s' is not available on this chain", args.GetArg("-changetype", "")));
+        if (auto availability_error{GetWalletOutputTypeInitError(
+                *walletInstance, parsed.value(), /*internal=*/true, "Change type", requested_type)}) {
+            error = *availability_error;
             return nullptr;
         }
         walletInstance->m_default_change_type = parsed.value();
