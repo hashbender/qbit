@@ -26,6 +26,9 @@ jobs:
         with:
           fetch-depth: 0
           filter: blob:none
+          # Don't persist the read-only GITHUB_TOKEN as a github.com auth header;
+          # it would override the MIRROR_PAT in the fork remote URL and 403 the push.
+          persist-credentials: false
 
       - name: Mirror new upstream PRs
         env:
