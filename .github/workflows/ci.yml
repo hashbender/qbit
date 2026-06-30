@@ -283,7 +283,7 @@ jobs:
     name: ${{ matrix.job-name }}
     runs-on: tenki-standard-medium-4c-8g
     needs: classify-changes
-    if: ${{ github.repository == 'Qbit-Org/qbit' && needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) }}
+    if: ${{ github.repository == 'Qbit-Org/qbit' && github.repository == 'Qbit-Org/qbit' && needs.classify-changes.outputs.source_validation_required == 'true' && (github.event_name != 'pull_request' || (github.event.pull_request.draft != true && (github.event.pull_request.head.repo.full_name == github.repository || contains(github.event.pull_request.labels.*.name, 'ci:qbit-trusted')))) }}
     timeout-minutes: 240
 
     env:
