@@ -43,6 +43,7 @@ jobs:
     name: RPC perf
     if: ${{ github.repository == 'Qbit-Org/qbit' }}
     if: ${{ github.repository == 'Qbit-Org/qbit' }}
+    if: ${{ github.repository == 'Qbit-Org/qbit' }}
     # Canonical repo only: perf jobs need Qbit-Org CI infra unreachable from forks.
     if: ${{ github.repository == 'Qbit-Org/qbit' }}
     runs-on: tenki-standard-large-plus-16c-32g
